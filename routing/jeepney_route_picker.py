@@ -957,15 +957,27 @@ class MultiJeepneyRouteFinder:
             if len(all_results) > 1:
                 print(f"   (Found {len(all_results)} alternatives)\n")
 
-        # Build top-3 alternatives by unique route-number combination,
-        # excluding the best result's own summary.
-        seen_summaries: set = {best.route_summary}
+        # Build top-3 alternatives with genuinely different corridors.
+        #
+        # "Corridor" = (first_route_number, last_route_number).
+        # Routes like  3 -> 25 -> 9  and  3 -> 5 -> 9  share corridor (3, 9)
+        # — the middle leg is just a short connector inside the same path.
+        # They are NOT real alternatives; only the best-scoring one survives.
+        # A true alternative must differ on the first OR last leg, meaning the
+        # passenger takes a meaningfully different journey to get there.
+        def _corridor(result: MultiJeepneyRouteResult) -> tuple:
+            nums = [s.route.route_number for s in result.segments]
+            return (nums[0], nums[-1])
+
+        best_corridor = _corridor(best)
+        seen_corridors: set = {best_corridor}
         unique_alternatives: List[MultiJeepneyRouteResult] = []
         for r in all_results[1:]:
-            if r.route_summary not in seen_summaries:
-                seen_summaries.add(r.route_summary)
+            c = _corridor(r)
+            if c not in seen_corridors:
+                seen_corridors.add(c)
                 unique_alternatives.append(r)
-            if len(unique_alternatives) >= 2:  # 2 more → together with best = top 3
+            if len(unique_alternatives) >= 2:  # 2 more -> together with best = top 3
                 break
         self._last_multi_alternatives = unique_alternatives
 

@@ -65,7 +65,18 @@ def find_route(req: RouteRequest):
     if result is None:
         raise HTTPException(status_code=404, detail="No route found within walking limits.")
 
-    return build_route_response(start, dest, result)
+    best = build_route_response(start, dest, result)
+
+    # Build alternatives from the caches populated during the search.
+    # _last_direct_alternatives: list of (JeepneyRoute, RouteEvaluationMeta)
+    # _last_multi_alternatives:  list of MultiJeepneyRouteResult
+    alternatives = []
+    for alt in finder._last_direct_alternatives:
+        alternatives.append(build_route_response(start, dest, alt))
+    for alt in finder._last_multi_alternatives:
+        alternatives.append(build_route_response(start, dest, alt))
+
+    return {"best": best, "alternatives": alternatives[:2]}
 
 
 # ---------------------------------------------------------------------------
