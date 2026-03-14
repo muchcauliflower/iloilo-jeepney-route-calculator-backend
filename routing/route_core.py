@@ -20,46 +20,52 @@ Response shape
   "total_distance_m": float,
   "total_duration_s": float,
 
-  # Flat markers list — used to place pins on the map
   "markers": [
     {"type": "start",  "lat": float, "lng": float},
     {"type": "board",  "lat": float, "lng": float, "route_number": str},
     {"type": "alight", "lat": float, "lng": float, "route_number": str},
-    ...
     {"type": "dest",   "lat": float, "lng": float}
   ],
 
-  # One entry per jeepney leg
   "segments": [
     {
-      "segment_index":       int,             # 0-based
+      "segment_index":       int,
       "route_number":        str,
       "direction":           str,
       "board_point":         {"lat": float, "lng": float},
       "alight_point":        {"lat": float, "lng": float},
-      "board_dist_m":        float,           # walk from prev point → board
-      "alight_dist_m":       float,           # walk from alight → next point
+      "board_dist_m":        float,
+      "alight_dist_m":       float,
       "jeepney_dist_m":      float,
       "score":               float,
-      "transfer_spot_name":  str | None,      # name of transfer spot, if applicable
+      "transfer_spot_name":  str | None,
+      "jeepney_polyline":    [{"latitude": float, "longitude": float}, ...],
+      "walk_to_polyline":    [{"latitude": float, "longitude": float}, ...],
+      "walk_from_polyline":  [{"latitude": float, "longitude": float}, ...],
 
-      # The jeepney polyline — ready for react-native-maps <Polyline>
-      # Each point is {latitude, longitude} (React Native convention)
-      "jeepney_polyline": [{"latitude": float, "longitude": float}, ...],
-
-      # Walking polylines fetched from ORS (or straight-line fallback)
-      # walk_to:   walk from previous location to this segment's board point
-      # walk_from: walk from this segment's alight point to the next location
-      "walk_to_polyline":   [{"latitude": float, "longitude": float}, ...],
-      "walk_from_polyline": [{"latitude": float, "longitude": float}, ...]
+      "traffic": {
+        "status":  "ok" | "no_data" | "disabled",
+        "overall": "CLEAR" | "MODERATE" | "HEAVY" | null,
+        "samples": [
+          {
+            "lat": float, "lng": float,
+            "current_speed_kmph":   float | null,
+            "free_flow_speed_kmph": float | null,
+            "ratio":                float | null,
+            "congestion":           "CLEAR" | "MODERATE" | "HEAVY" | "NO_DATA",
+            "road_description":     str | null
+          }
+        ]
+      }
     }
   ]
 }
 """
 
 import os
+import requests
 import openrouteservice
-from typing import Union, Tuple, List
+from typing import Tuple, List, Optional
 
 from routing.jeepney_route_picker import (
     MultiJeepneyRouteResult,
@@ -70,7 +76,10 @@ from routing.jeepney_route_picker import (
 
 LatLng = Tuple[float, float]
 
-# Lazy-initialise so importing this module never crashes if key is missing
+# ---------------------------------------------------------------------------
+# ORS client (lazy init)
+# ---------------------------------------------------------------------------
+
 _ors_client = None
 
 
@@ -107,6 +116,157 @@ def get_walking_polyline(start: LatLng, end: LatLng) -> List[dict]:
 
 
 # ---------------------------------------------------------------------------
+# TomTom Traffic Flow
+# ---------------------------------------------------------------------------
+
+# How many evenly-spaced points along the jeepney polyline to sample.
+_TRAFFIC_SAMPLE_COUNT = 5
+
+# Congestion thresholds (currentSpeed / freeFlowSpeed ratio)
+_THRESHOLD_HEAVY    = 0.50   # < 50%  → HEAVY
+_THRESHOLD_MODERATE = 0.75   # < 75%  → MODERATE  (else CLEAR)
+
+_TOMTOM_FLOW_URL = (
+    "https://api.tomtom.com/traffic/services/4/flowSegmentData/"
+    "absolute/10/json"
+)
+
+
+def _sample_polyline(polyline: List[LatLng], n: int) -> List[LatLng]:
+    """Return n evenly-spaced points from a polyline (always includes endpoints)."""
+    if len(polyline) <= n:
+        return polyline
+    indices = [round(i * (len(polyline) - 1) / (n - 1)) for i in range(n)]
+    return [polyline[i] for i in indices]
+
+
+def _query_flow_segment(lat: float, lng: float, api_key: str) -> Optional[dict]:
+    """
+    Call TomTom Flow Segment Data for a single point.
+    Returns the flowSegmentData dict, or None on any failure.
+    """
+    try:
+        resp = requests.get(
+            _TOMTOM_FLOW_URL,
+            params={
+                "key":   api_key,
+                "point": f"{lat},{lng}",
+                "unit":  "KMPH",
+            },
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            return resp.json().get("flowSegmentData")
+        return None
+    except Exception:
+        return None
+
+
+def _congestion_label(ratio: float) -> str:
+    if ratio < _THRESHOLD_HEAVY:
+        return "HEAVY"
+    if ratio < _THRESHOLD_MODERATE:
+        return "MODERATE"
+    return "CLEAR"
+
+
+def get_traffic_flow_for_segment(
+    jeepney_polyline: List[LatLng],
+    route_number: str,
+    segment_index: int,
+) -> dict:
+    """
+    Sample the jeepney polyline, query TomTom Flow for each sample point,
+    and return a traffic summary dict to attach to the segment.
+    """
+    api_key = os.getenv("TOMTOM_API_KEY")
+    if not api_key:
+        return {"status": "disabled", "overall": None, "samples": []}
+
+    sample_points = _sample_polyline(jeepney_polyline, _TRAFFIC_SAMPLE_COUNT)
+    samples = []
+    ratios  = []
+
+    for lat, lng in sample_points:
+        data = _query_flow_segment(lat, lng, api_key)
+        if data is None:
+            samples.append({
+                "lat": lat, "lng": lng,
+                "current_speed_kmph":   None,
+                "free_flow_speed_kmph": None,
+                "ratio":                None,
+                "congestion":           "NO_DATA",
+                "road_description":     None,
+            })
+            continue
+
+        current   = data.get("currentSpeed")
+        free_flow = data.get("freeFlowSpeed")
+        coords    = data.get("coordinates", {}).get("coordinate", [])
+        road_desc = f"{len(coords)}-point segment" if coords else None
+
+        ratio = (current / free_flow) if (current and free_flow and free_flow > 0) else None
+        if ratio is not None:
+            ratios.append(ratio)
+
+        samples.append({
+            "lat": lat, "lng": lng,
+            "current_speed_kmph":   current,
+            "free_flow_speed_kmph": free_flow,
+            "ratio":                round(ratio, 3) if ratio is not None else None,
+            "congestion":           _congestion_label(ratio) if ratio is not None else "NO_DATA",
+            "road_description":     road_desc,
+        })
+
+    if not ratios:
+        overall = None
+        status  = "no_data"
+    else:
+        overall = _congestion_label(min(ratios))
+        status  = "ok"
+
+    _print_traffic_summary(route_number, segment_index, samples, overall, status)
+
+    return {"status": status, "overall": overall, "samples": samples}
+
+
+def _print_traffic_summary(
+    route_number: str,
+    segment_index: int,
+    samples: list,
+    overall: Optional[str],
+    status: str,
+) -> None:
+    """Print a readable traffic summary to the console for this segment."""
+    icon_map = {"CLEAR": "🟢", "MODERATE": "🟡", "HEAVY": "🔴", "NO_DATA": "⚪"}
+    overall_icon = icon_map.get(overall, "⚪") if overall else "⚪"
+
+    print(f"\n  🚦 Traffic — Route {route_number} (Leg {segment_index + 1})")
+    print(f"     Overall : {overall_icon} {overall or 'NO DATA'}")
+
+    if status == "disabled":
+        print("     ⚠️  TOMTOM_API_KEY not set — traffic disabled")
+        return
+    if status == "no_data":
+        print("     ℹ️  No flow data returned for this corridor (coverage gap)")
+        return
+
+    for i, s in enumerate(samples, start=1):
+        cong  = s["congestion"]
+        icon  = icon_map.get(cong, "⚪")
+        if s["ratio"] is not None:
+            pct = round(s["ratio"] * 100)
+            speed_info = (
+                f"{s['current_speed_kmph']:.0f} km/h"
+                f" (free-flow {s['free_flow_speed_kmph']:.0f} km/h, {pct}%)"
+            )
+        else:
+            speed_info = "no data"
+        print(f"     Sample {i}: {icon} {cong:<8}  {speed_info}"
+              f"  @ ({s['lat']:.5f}, {s['lng']:.5f})")
+
+
+# ---------------------------------------------------------------------------
 # Segment builder helpers
 # ---------------------------------------------------------------------------
 
@@ -115,26 +275,33 @@ def _build_segment_dict(
     route_number: str,
     direction: str,
     meta: RouteEvaluationMeta,
-    walk_from_prev: LatLng,   # previous location  → board point
-    walk_to_next: LatLng,     # alight point        → next location
+    walk_from_prev: LatLng,
+    walk_to_next: LatLng,
 ) -> dict:
-    jeepney_polyline = [_rn_point(lat, lng) for (lat, lng) in meta.jeepney_segment]
+    jeepney_polyline   = [_rn_point(lat, lng) for (lat, lng) in meta.jeepney_segment]
     walk_to_polyline   = get_walking_polyline(walk_from_prev, meta.board_point)
     walk_from_polyline = get_walking_polyline(meta.alight_point, walk_to_next)
 
+    traffic = get_traffic_flow_for_segment(
+        jeepney_polyline=meta.jeepney_segment,
+        route_number=route_number,
+        segment_index=index,
+    )
+
     return {
-        "segment_index":    index,
-        "route_number":     route_number,
-        "direction":        direction,
-        "board_point":      {"lat": meta.board_point[0],  "lng": meta.board_point[1]},
-        "alight_point":     {"lat": meta.alight_point[0], "lng": meta.alight_point[1]},
-        "board_dist_m":     meta.board_dist_m,
-        "alight_dist_m":    meta.alight_dist_m,
-        "jeepney_dist_m":   meta.jeepney_dist_m,
-        "score":            meta.score,
-        "jeepney_polyline": jeepney_polyline,
+        "segment_index":      index,
+        "route_number":       route_number,
+        "direction":          direction,
+        "board_point":        {"lat": meta.board_point[0],  "lng": meta.board_point[1]},
+        "alight_point":       {"lat": meta.alight_point[0], "lng": meta.alight_point[1]},
+        "board_dist_m":       meta.board_dist_m,
+        "alight_dist_m":      meta.alight_dist_m,
+        "jeepney_dist_m":     meta.jeepney_dist_m,
+        "score":              meta.score,
+        "jeepney_polyline":   jeepney_polyline,
         "walk_to_polyline":   walk_to_polyline,
         "walk_from_polyline": walk_from_polyline,
+        "traffic":            traffic,
     }
 
 
@@ -175,19 +342,11 @@ def build_route_response(
         # ---- Transfer route ------------------------------------------------
         segments_raw = []
         for i, seg in enumerate(result.segments):
-            # Determine the "next location" for the final walk of this segment:
-            #   - for all but the last segment: the next segment's board point
-            #     (which equals the transfer spot location)
-            #   - for the last segment: the final destination
             if i < len(result.segments) - 1:
                 next_loc = result.transfers[i].to_board_point
             else:
                 next_loc = dest
 
-            # Walk to this segment's board comes from:
-            #   - segment 0: the start point
-            #   - segment n: the transfer spot (previous alight → transfer spot
-            #     was already resolved; transfer spot IS the new start)
             if i == 0:
                 prev_loc = start
             else:
@@ -202,7 +361,6 @@ def build_route_response(
                 walk_to_next=next_loc,
             )
 
-            # Add transfer spot name if this segment has a transfer after it
             if i < len(result.transfers):
                 try:
                     segment_dict["transfer_spot_name"] = result.transfers[i].transfer_spot.name
@@ -214,14 +372,14 @@ def build_route_response(
             segments_raw.append(segment_dict)
 
         return {
-            "type":               "transfer",
-            "summary":            result.route_summary,
+            "type":                "transfer",
+            "summary":             result.route_summary,
             "number_of_transfers": result.number_of_transfers,
-            "total_score":        result.total_score,
-            "total_distance_m":   result.total_distance,
-            "total_duration_s":   result.total_duration,
-            "markers":            _build_markers(start, dest, segments_raw),
-            "segments":           segments_raw,
+            "total_score":         result.total_score,
+            "total_distance_m":    result.total_distance,
+            "total_duration_s":    result.total_duration,
+            "markers":             _build_markers(start, dest, segments_raw),
+            "segments":            segments_raw,
         }
 
     else:
@@ -238,12 +396,12 @@ def build_route_response(
         seg["transfer_spot_name"] = None
 
         return {
-            "type":               "direct",
-            "summary":            route.route_number,
+            "type":                "direct",
+            "summary":             route.route_number,
             "number_of_transfers": 0,
-            "total_score":        meta.score,
-            "total_distance_m":   meta.board_dist_m + meta.jeepney_dist_m + meta.alight_dist_m,
-            "total_duration_s":   None,   # not computed for direct routes currently
-            "markers":            _build_markers(start, dest, [seg]),
-            "segments":           [seg],
+            "total_score":         meta.score,
+            "total_distance_m":    meta.board_dist_m + meta.jeepney_dist_m + meta.alight_dist_m,
+            "total_duration_s":    None,
+            "markers":             _build_markers(start, dest, [seg]),
+            "segments":            [seg],
         }

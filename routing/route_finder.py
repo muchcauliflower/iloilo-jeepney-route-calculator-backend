@@ -22,10 +22,10 @@ from routing.route_core import build_route_response
 #   🟣 Purple solid  — jeepney ride (3rd)
 # ---------------------------------------------------------------------------
 JEEPNEY_COLORS = ["blue", "orange", "purple"]
-WALK_COLOR  = "green"
-WALK_DASH   = "8 6"
-WALK_WEIGHT = 3
-RIDE_WEIGHT = 5
+WALK_COLOR   = "green"
+WALK_DASH    = "8 6"
+WALK_WEIGHT  = 3
+RIDE_WEIGHT  = 5
 RIDE_OPACITY = 0.85
 
 
@@ -40,7 +40,6 @@ def build_map(start: tuple, dest: tuple, response: dict) -> folium.Map:
     centre_lon = (start[1] + dest[1]) / 2
     m = folium.Map(location=[centre_lat, centre_lon], zoom_start=14)
 
-    # Start / destination markers
     folium.Marker(start, popup="📍 Start",
                   icon=folium.Icon(color="blue", icon="home")).add_to(m)
     folium.Marker(dest,  popup="🏁 Destination",
@@ -49,37 +48,31 @@ def build_map(start: tuple, dest: tuple, response: dict) -> folium.Map:
     for seg in response["segments"]:
         color = JEEPNEY_COLORS[seg["segment_index"] % len(JEEPNEY_COLORS)]
 
-        # Walk to board
         walk_to = [(p["latitude"], p["longitude"]) for p in seg["walk_to_polyline"]]
         folium.PolyLine(walk_to, color=WALK_COLOR, weight=WALK_WEIGHT,
                         dash_array=WALK_DASH,
                         tooltip="Walk to jeepney").add_to(m)
 
-        # Board marker
         board = (seg["board_point"]["lat"], seg["board_point"]["lng"])
         folium.Marker(board,
                       popup=f"🟢 Board Jeepney {seg['route_number']}",
                       icon=folium.Icon(color="green", icon="arrow-up")).add_to(m)
 
-        # Jeepney ride
         ride = [(p["latitude"], p["longitude"]) for p in seg["jeepney_polyline"]]
         folium.PolyLine(ride, color=color, weight=RIDE_WEIGHT,
                         opacity=RIDE_OPACITY,
                         tooltip=f"Jeepney {seg['route_number']}").add_to(m)
 
-        # Alight marker
         alight = (seg["alight_point"]["lat"], seg["alight_point"]["lng"])
         folium.Marker(alight,
                       popup=f"🔴 Alight Jeepney {seg['route_number']}",
                       icon=folium.Icon(color="red", icon="arrow-down")).add_to(m)
 
-        # Walk from alight
         walk_from = [(p["latitude"], p["longitude"]) for p in seg["walk_from_polyline"]]
         folium.PolyLine(walk_from, color=WALK_COLOR, weight=WALK_WEIGHT,
                         dash_array=WALK_DASH,
                         tooltip="Walk to destination / transfer").add_to(m)
 
-    # Legend
     legend_html = """
     <div style="
         position: fixed; bottom: 30px; right: 10px; z-index: 1000;
@@ -120,9 +113,13 @@ def build_map(start: tuple, dest: tuple, response: dict) -> folium.Map:
     return m
 
 
+# ---------------------------------------------------------------------------
+# Result label
+# ---------------------------------------------------------------------------
+
 def _make_result_label(response: dict) -> str:
     if response["type"] == "transfer":
-        km = response["total_distance_m"] / 1000
+        km   = response["total_distance_m"] / 1000
         mins = (response["total_duration_s"] or 0) / 60
         return (
             f"Transfer Route: {response['summary']} — "
@@ -143,11 +140,66 @@ def _make_result_label(response: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Traffic UI helpers
+# ---------------------------------------------------------------------------
+
+def _traffic_badge(overall: str | None, status: str) -> str:
+    """Return a short emoji+text badge for the traffic overall status."""
+    if status == "disabled":
+        return "🔘 Traffic: N/A"
+    if status == "no_data" or overall is None:
+        return "⚪ Traffic: No coverage data"
+    icons = {"CLEAR": "🟢", "MODERATE": "🟡", "HEAVY": "🔴"}
+    return f"{icons.get(overall, '⚪')} Traffic: {overall}"
+
+
+def _render_traffic_info(st_col, segments: list) -> None:
+    """Render per-segment traffic info as Streamlit expanders."""
+    st_col.markdown("#### 🚦 Traffic Conditions")
+    for seg in segments:
+        traffic = seg.get("traffic", {})
+        status  = traffic.get("status", "disabled")
+        overall = traffic.get("overall")
+        badge   = _traffic_badge(overall, status)
+
+        label = f"Route {seg['route_number']} (Leg {seg['segment_index'] + 1})  —  {badge}"
+        with st_col.expander(label, expanded=(overall in ("HEAVY", "MODERATE"))):
+            if status == "disabled":
+                st_col.info(
+                    "TOMTOM_API_KEY is not set. "
+                    "Add it to your .env file to enable traffic data."
+                )
+            elif status == "no_data":
+                st_col.warning(
+                    "TomTom returned no flow data for this corridor. "
+                    "This is likely a coverage gap — not necessarily clear roads."
+                )
+            else:
+                samples  = traffic.get("samples", [])
+                icon_map = {"CLEAR": "🟢", "MODERATE": "🟡", "HEAVY": "🔴", "NO_DATA": "⚪"}
+                for i, s in enumerate(samples, start=1):
+                    cong = s["congestion"]
+                    icon = icon_map.get(cong, "⚪")
+                    if s["ratio"] is not None:
+                        pct        = round(s["ratio"] * 100)
+                        speed_text = (
+                            f"{s['current_speed_kmph']:.0f} km/h "
+                            f"(free-flow {s['free_flow_speed_kmph']:.0f} km/h — {pct}%)"
+                        )
+                    else:
+                        speed_text = "No data"
+                    st_col.write(
+                        f"{icon} **Sample {i}** — {cong}  |  {speed_text}  "
+                        f"@ `{s['lat']:.5f}, {s['lng']:.5f}`"
+                    )
+
+
+# ---------------------------------------------------------------------------
 # Streamlit app entry point
 # ---------------------------------------------------------------------------
 
 def runUI():
-    for key in ("map_obj", "result_label", "error_msg"):
+    for key in ("map_obj", "result_label", "error_msg", "response"):
         if key not in st.session_state:
             st.session_state[key] = None
 
@@ -155,11 +207,11 @@ def runUI():
 
     col1, col2 = st.columns(2)
     with col1:
-        start_lat = st.number_input("Start Latitude",       value=10.7202,  format="%.6f")
-        start_lon = st.number_input("Start Longitude",      value=122.5621, format="%.6f")
+        start_lat = st.number_input("Start Latitude",        value=10.7202,  format="%.6f")
+        start_lon = st.number_input("Start Longitude",       value=122.5621, format="%.6f")
     with col2:
-        dest_lat  = st.number_input("Destination Latitude", value=10.7015,  format="%.6f")
-        dest_lon  = st.number_input("Destination Longitude",value=122.5690, format="%.6f")
+        dest_lat  = st.number_input("Destination Latitude",  value=10.7015,  format="%.6f")
+        dest_lon  = st.number_input("Destination Longitude", value=122.5690, format="%.6f")
 
     if st.button("Find Route"):
         start_node = (start_lat, start_lon)
@@ -174,19 +226,22 @@ def runUI():
             )
 
         if result is not None:
-            with st.spinner("Fetching walking directions..."):
+            with st.spinner("Fetching walking directions & traffic..."):
                 response = build_route_response(start_node, dest_node, result)
 
             st.session_state.map_obj      = build_map(start_node, dest_node, response)
             st.session_state.result_label = _make_result_label(response)
+            st.session_state.response     = response
             st.session_state.error_msg    = None
         else:
             st.session_state.map_obj      = None
             st.session_state.result_label = None
+            st.session_state.response     = None
             st.session_state.error_msg    = "No route found within walking limits."
 
     if st.session_state.map_obj is not None:
         st.success(st.session_state.result_label)
         st_folium(st.session_state.map_obj, width=700, height=520, returned_objects=[])
+        _render_traffic_info(st, st.session_state.response["segments"])
     elif st.session_state.error_msg:
         st.error(st.session_state.error_msg)
