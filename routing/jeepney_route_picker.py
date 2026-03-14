@@ -526,6 +526,10 @@ class EnhancedRouteFinder:
         best_meta: Optional[RouteEvaluationMeta] = None
         best_score = float("inf")
 
+        # Track best result per unique route number for alternatives
+        # { route_number -> (JeepneyRoute, RouteEvaluationMeta) }
+        best_per_route_number: Dict[str, Tuple[JeepneyRoute, RouteEvaluationMeta]] = {}
+
         if debug:
             print(f"\n🔍 Evaluating {len(routes)} jeepney routes with loop support...\n")
 
@@ -564,6 +568,11 @@ class EnhancedRouteFinder:
                 print(f"     Alight idx={meta.alight_idx} dist={meta.alight_dist_m:.1f}m")
                 print(f"     Jeepney ride distance={meta.jeepney_dist_m:.1f}m")
 
+            # Keep only the best score seen for each route number
+            existing = best_per_route_number.get(route.route_number)
+            if existing is None or meta.score < existing[1].score:
+                best_per_route_number[route.route_number] = (route, meta)
+
             if meta.score < best_score:
                 best_score = meta.score
                 best_route = route
@@ -585,6 +594,15 @@ class EnhancedRouteFinder:
             print(f"   Board idx: {best_meta.board_idx} | Alight idx: {best_meta.alight_idx}")
             print(f"   Board dist: {best_meta.board_dist_m:.1f}m | Alight dist: {best_meta.alight_dist_m:.1f}m")
             print(f"   Jeepney dist: {best_meta.jeepney_dist_m:.1f}m | Score: {best_meta.score:.1f}")
+
+        # Build top-3 alternatives sorted by score, excluding the best route number
+        self._last_direct_alternatives = sorted(
+            [
+                (r, m) for rn, (r, m) in best_per_route_number.items()
+                if rn != best_route.route_number
+            ],
+            key=lambda x: x[1].score,
+        )[:2]  # 2 more → together with best = top 3
 
         return best_route, best_meta
 
@@ -650,6 +668,9 @@ class MultiJeepneyRouteFinder:
     def __init__(self, transfer_spots: Optional[List[TransferSpot]] = None):
         self._transfer_spots: List[TransferSpot] = transfer_spots or []
         self._single_route_finder = EnhancedRouteFinder()
+        # Populated after each search — top-2 runners-up (different route numbers)
+        self._last_direct_alternatives: List[Tuple[JeepneyRoute, RouteEvaluationMeta]] = []
+        self._last_multi_alternatives: List[MultiJeepneyRouteResult] = []
 
     def load_transfer_spots(self, path: str) -> None:
         try:
@@ -936,6 +957,18 @@ class MultiJeepneyRouteFinder:
             if len(all_results) > 1:
                 print(f"   (Found {len(all_results)} alternatives)\n")
 
+        # Build top-3 alternatives by unique route-number combination,
+        # excluding the best result's own summary.
+        seen_summaries: set = {best.route_summary}
+        unique_alternatives: List[MultiJeepneyRouteResult] = []
+        for r in all_results[1:]:
+            if r.route_summary not in seen_summaries:
+                seen_summaries.add(r.route_summary)
+                unique_alternatives.append(r)
+            if len(unique_alternatives) >= 2:  # 2 more → together with best = top 3
+                break
+        self._last_multi_alternatives = unique_alternatives
+
         return best
 
     # ------------------------------------------------------------------
@@ -948,7 +981,15 @@ class MultiJeepneyRouteFinder:
         max_alight_distance: float = 500.0,
         debug: bool = False,
     ):
-        """Try a single route first; fall back to multi-route with transfer."""
+        """Try a single route first; fall back to multi-route with transfer.
+
+        Always prints the top-3 unique-route alternatives to the console
+        (regardless of the debug flag), then returns the single best result.
+        """
+        # Reset alternative caches
+        self._last_direct_alternatives = []
+        self._last_multi_alternatives = []
+
         best_route, best_meta = self._single_route_finder.find_best_route(
             all_routes, start, dest,
             max_board_distance=max_board_distance,
@@ -959,6 +1000,14 @@ class MultiJeepneyRouteFinder:
         if best_route is not None:
             if debug:
                 print("✅ Direct route found\n")
+
+            # _last_direct_alternatives was populated inside find_best_route.
+            # Only include genuinely different route numbers — if the list is
+            # empty it means only one route number could service this trip.
+            all_direct: List[Tuple[JeepneyRoute, RouteEvaluationMeta]] = (
+                [(best_route, best_meta)] + self._last_direct_alternatives
+            )
+            self._print_top3_direct(all_direct)
             return best_route, best_meta
 
         if debug:
@@ -972,11 +1021,95 @@ class MultiJeepneyRouteFinder:
         )
 
         if multi_result is not None:
+            # _last_multi_alternatives was populated inside find_best_multi_route
+            all_multi: List[MultiJeepneyRouteResult] = (
+                [multi_result] + self._last_multi_alternatives
+            )
+            self._print_top3_multi(all_multi)
             return multi_result
 
         if debug:
             print("❌ No route found\n")
         return None
+
+    # ------------------------------------------------------------------
+    # Console printers for top-3 alternatives
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _print_top3_direct(
+        results: List[Tuple[JeepneyRoute, RouteEvaluationMeta]],
+    ) -> None:
+        """Print up to 3 best direct routes (unique route numbers) to the console.
+
+        If only one route number can service this trip, explicitly says so
+        rather than misleadingly showing a single "alternative".
+        """
+        print("\n" + "=" * 60)
+        has_alternatives = len(results) > 1
+        if has_alternatives:
+            print(f"🏆 TOP {min(3, len(results))} DIRECT ROUTE OPTIONS (different route numbers)")
+        else:
+            print("🏆 BEST DIRECT ROUTE  (no other route numbers available)")
+        print("=" * 60)
+
+        for rank, (route, meta) in enumerate(results[:3], start=1):
+            total_m = meta.board_dist_m + meta.jeepney_dist_m + meta.alight_dist_m
+            label = f"#{rank}" if has_alternatives else "✅"
+            print(
+                f"  {label}  Route {route.route_number} ({route.direction})\n"
+                f"       Score      : {meta.score:.1f}\n"
+                f"       Board walk : {meta.board_dist_m:.0f} m\n"
+                f"       Jeepney    : {meta.jeepney_dist_m:.0f} m\n"
+                f"       Alight walk: {meta.alight_dist_m:.0f} m\n"
+                f"       Total dist : {total_m / 1000:.2f} km"
+            )
+            if rank < len(results[:3]):
+                print("  " + "-" * 56)
+
+        if not has_alternatives:
+            print("\n  ℹ️  Only one route number services this trip.")
+        print("=" * 60 + "\n")
+
+    @staticmethod
+    def _print_top3_multi(
+        results: List[MultiJeepneyRouteResult],
+    ) -> None:
+        """Print up to 3 best transfer routes (unique summaries) to the console.
+
+        If only one route combination can service this trip, explicitly says so.
+        """
+        print("\n" + "=" * 60)
+        has_alternatives = len(results) > 1
+        if has_alternatives:
+            print(f"🏆 TOP {min(3, len(results))} TRANSFER ROUTE OPTIONS (different route combinations)")
+        else:
+            print("🏆 BEST TRANSFER ROUTE  (no other route combinations available)")
+        print("=" * 60)
+
+        for rank, result in enumerate(results[:3], start=1):
+            label = f"#{rank}" if has_alternatives else "✅"
+            print(
+                f"  {label}  {result.route_summary}\n"
+                f"       Transfers  : {result.number_of_transfers}\n"
+                f"       Score      : {result.total_score:.1f}\n"
+                f"       Distance   : {result.total_distance / 1000:.2f} km\n"
+                f"       Duration   : {result.total_duration / 60:.0f} min"
+            )
+            for i, seg in enumerate(result.segments):
+                m = seg.meta
+                print(
+                    f"       Leg {i + 1}: Jeepney {seg.route.route_number} ({seg.route.direction})"
+                    f" | board {m.board_dist_m:.0f}m walk"
+                    f" | ride {m.jeepney_dist_m:.0f}m"
+                    f" | alight {m.alight_dist_m:.0f}m walk"
+                )
+            if rank < len(results[:3]):
+                print("  " + "-" * 56)
+
+        if not has_alternatives:
+            print("\n  ℹ️  Only one route combination services this trip.")
+        print("=" * 60 + "\n")
 
 
 # ---------------------------------------------------------------------------
