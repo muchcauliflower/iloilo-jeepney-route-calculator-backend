@@ -665,22 +665,15 @@ class MultiJeepneyRouteFinder:
     WALK_SPEED = 1.4    # m/s
     JEEPNEY_SPEED = 5.56  # m/s (~20 km/h)
 
-    def __init__(self, transfer_spots: Optional[List[TransferSpot]] = None):
-        self._transfer_spots: List[TransferSpot] = transfer_spots or []
+    # Maximum distance between two route polylines to be considered a
+    # candidate transfer zone (metres).
+    TRANSFER_ZONE_THRESHOLD = 150.0
+
+    def __init__(self):
         self._single_route_finder = EnhancedRouteFinder()
         # Populated after each search — top-2 runners-up (different route numbers)
         self._last_direct_alternatives: List[Tuple[JeepneyRoute, RouteEvaluationMeta]] = []
         self._last_multi_alternatives: List[MultiJeepneyRouteResult] = []
-
-    def load_transfer_spots(self, path: str) -> None:
-        try:
-            with open(path, "r") as f:
-                data = json.load(f)
-            self._transfer_spots = [TransferSpot.from_json(d) for d in data]
-            print(f"✅ Loaded {len(self._transfer_spots)} transfer spots")
-        except Exception as e:
-            print(f"❌ Error loading transfer spots: {e}")
-            self._transfer_spots = []
 
     # ------------------------------------------------------------------
     def _dist(self, p1: LatLng, p2: LatLng) -> float:
@@ -697,18 +690,75 @@ class MultiJeepneyRouteFinder:
                     break
         return nearby
 
-    def _find_transfer_spots_for_route(
-        self, route: JeepneyRoute, max_distance_from_route: float
-    ) -> List[TransferSpot]:
-        accessible = []
-        for spot in self._transfer_spots:
-            if route.route_number not in spot.routes:
-                continue
-            for coord in route.coordinates:
-                if self._dist(coord, spot.location) <= max_distance_from_route:
-                    accessible.append(spot)
-                    break
-        return accessible
+    @dataclass
+    class _GeometricTransferZone:
+        """
+        A candidate transfer point derived purely from route geometry.
+        alight_point  — where the passenger steps off route_a
+        board_point   — where they board route_b  (may differ by walk_distance)
+        walk_distance — metres between the two points
+        """
+        alight_point: "LatLng"
+        board_point:  "LatLng"
+        walk_distance: float
+
+    def _closest_approach_between_routes(
+        self,
+        route_a: "JeepneyRoute",
+        route_b: "JeepneyRoute",
+        threshold: float,
+    ) -> "Optional[MultiJeepneyRouteFinder._GeometricTransferZone]":
+        """
+        Find the single closest pair of points between route_a and route_b
+        whose distance is within `threshold` metres.
+
+        We check every node on route_a against every node on route_b, then
+        also every node against every segment on the opposite route, giving
+        sub-node precision without a full continuous sweep.
+
+        Returns the closest-approach zone, or None if no pair is within threshold.
+        """
+        best_dist = threshold
+        best_a: Optional[LatLng] = None
+        best_b: Optional[LatLng] = None
+
+        coords_a = route_a.coordinates
+        coords_b = route_b.coordinates
+
+        rf = self._single_route_finder   # reuse point-to-segment helper
+
+        # Node-to-node
+        for pa in coords_a:
+            for pb in coords_b:
+                d = self._dist(pa, pb)
+                if d < best_dist:
+                    best_dist = d
+                    best_a, best_b = pa, pb
+
+        # Node of A against segments of B
+        for pa in coords_a:
+            for i in range(len(coords_b) - 1):
+                d, closest = rf._point_to_segment_distance(pa, coords_b[i], coords_b[i + 1])
+                if d < best_dist:
+                    best_dist = d
+                    best_a, best_b = pa, closest
+
+        # Node of B against segments of A
+        for pb in coords_b:
+            for i in range(len(coords_a) - 1):
+                d, closest = rf._point_to_segment_distance(pb, coords_a[i], coords_a[i + 1])
+                if d < best_dist:
+                    best_dist = d
+                    best_a, best_b = closest, pb
+
+        if best_a is None:
+            return None
+
+        return MultiJeepneyRouteFinder._GeometricTransferZone(
+            alight_point=best_a,
+            board_point=best_b,
+            walk_distance=best_dist,
+        )
 
     def _dist_to_destination(self, current: LatLng, dest: LatLng) -> float:
         return self._dist(current, dest)
@@ -818,41 +868,68 @@ class MultiJeepneyRouteFinder:
                 route_str = " → ".join(s.route.route_number for s in segments)
                 print(f"   ✅ Found path: {route_str} ({final_duration / 60:.0f}min)")
 
-        # ---- Recursive case: try adding a transfer ----
+        # ---- Recursive case: geometric transfer zones ----
         if transfers_remaining > 0:
-            for transfer_spot in self._transfer_spots:
-                candidate_routes = [
-                    r for r in all_routes
-                    if r.route_number not in current_path.used_routes
-                    and r.route_number in transfer_spot.routes
-                ]
-                if not candidate_routes:
-                    continue
+            # Routes that can board from current location
+            start_routes = [
+                r for r in all_routes
+                if r.route_number not in current_path.used_routes
+                and any(
+                    self._dist(c, current_path.current_location) <= max_board_distance
+                    for c in r.coordinates
+                )
+            ]
+            # Routes that can reach the destination
+            dest_routes = [
+                r for r in all_routes
+                if r.route_number not in current_path.used_routes
+                and any(
+                    self._dist(c, destination) <= max_alight_distance
+                    for c in r.coordinates
+                )
+            ]
+            dest_route_numbers = {r.route_number for r in dest_routes}
 
-                for route in candidate_routes:
+            for route_a in start_routes:
+                for route_b in dest_routes:
+                    if route_a.route_number == route_b.route_number:
+                        continue
+                    if route_b.route_number in current_path.used_routes:
+                        continue
+
+                    zone = self._closest_approach_between_routes(
+                        route_a, route_b,
+                        self.TRANSFER_ZONE_THRESHOLD,
+                    )
+                    if zone is None:
+                        continue
+                    if zone.walk_distance > max_transfer_walk_distance:
+                        continue
+
+                    # PRUNING 5: transfer zone must progress toward destination
+                    new_dist_to_dest = self._dist_to_destination(zone.board_point, destination)
+                    if new_dist_to_dest >= current_dist_to_dest * 1.3:
+                        continue
+
                     board_dist = (
                         max_board_distance if not current_path.segments
                         else max_transfer_walk_distance
                     )
 
                     meta = self._single_route_finder.evaluate_route(
-                        route.coordinates,
+                        route_a.coordinates,
                         current_path.current_location,
-                        transfer_spot.location,
+                        zone.alight_point,
                         max_board_distance=board_dist,
                         max_alight_distance=max_transfer_walk_distance,
                     )
                     if meta is None:
                         continue
 
-                    transfer_walk_dist = self._dist(meta.alight_point, transfer_spot.location)
-                    if transfer_walk_dist > max_transfer_walk_distance:
-                        continue
-
                     new_score = (
                         current_path.accumulated_score
                         + meta.score
-                        + transfer_walk_dist * transfer_walk_weight
+                        + zone.walk_distance * transfer_walk_weight
                         + transfer_penalty
                     )
                     new_distance = (
@@ -860,36 +937,40 @@ class MultiJeepneyRouteFinder:
                         + meta.board_dist_m
                         + meta.jeepney_dist_m
                         + meta.alight_dist_m
-                        + transfer_walk_dist
+                        + zone.walk_distance
                     )
 
-                    # PRUNING 5: must be making progress toward destination
-                    new_dist_to_dest = self._dist_to_destination(transfer_spot.location, destination)
-                    if new_dist_to_dest >= current_dist_to_dest * 1.3:
-                        continue
+                    # Build a synthetic TransferSpot so TransferConnection keeps working
+                    synthetic_spot = TransferSpot(
+                        name=f"{route_a.route_number}↔{route_b.route_number} zone",
+                        location=zone.board_point,
+                        routes=[route_a.route_number, route_b.route_number],
+                        priority="geometric",
+                    )
 
                     new_segment = MultiRouteSegment(
-                        route=route, meta=meta,
+                        route=route_a, meta=meta,
                         segment_order=len(current_path.segments) + 1,
                     )
                     new_transfer = TransferConnection(
-                        transfer_spot=transfer_spot,
+                        transfer_spot=synthetic_spot,
                         from_segment=new_segment,
                         from_alight_point=meta.alight_point,
-                        to_board_point=transfer_spot.location,
-                        walk_distance=transfer_walk_dist,
+                        to_board_point=zone.board_point,
+                        walk_distance=zone.walk_distance,
                     )
                     new_path = _PartialPath(
                         segments=current_path.segments + [new_segment],
                         transfers=current_path.transfers + [new_transfer],
-                        current_location=transfer_spot.location,
+                        current_location=zone.board_point,
                         accumulated_score=new_score,
                         accumulated_distance=new_distance,
-                        used_routes=current_path.used_routes | {route.route_number},
+                        used_routes=current_path.used_routes | {route_a.route_number},
                     )
 
                     if debug and is_top_level:
-                        print(f"   🔄 Trying: {route.route_number} → {transfer_spot.name}")
+                        print(f"   🔄 Geometric transfer: {route_a.route_number} → {route_b.route_number}"
+                              f" (walk {zone.walk_distance:.0f}m)")
 
                     sub_results = self._find_routes_recursive(
                         all_routes=all_routes,
@@ -1148,12 +1229,10 @@ def load_routes(routes_path: str) -> List[JeepneyRoute]:
 if __name__ == "__main__":
     root_dir = Path(__file__).resolve().parent.parent
     routes_path = root_dir / "data" / "jeepney_routes.json"
-    transfers_path = root_dir / "data" / "transfer_spots.json"
 
     routes = load_routes(str(routes_path))
 
     finder = MultiJeepneyRouteFinder()
-    finder.load_transfer_spots(str(transfers_path))
 
     my_start: LatLng = (10.7202, 122.5621)
     my_dest: LatLng  = (10.7015, 122.5690)

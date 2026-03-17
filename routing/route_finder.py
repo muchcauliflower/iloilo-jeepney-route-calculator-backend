@@ -220,7 +220,6 @@ def runUI():
         with st.spinner("Finding route..."):
             routes = load_routes("data/jeepney_routes.json")
             finder = MultiJeepneyRouteFinder()
-            finder.load_transfer_spots("data/transfer_spots.json")
             result = finder.find_best_route_with_transfer(
                 routes, start_node, dest_node, debug=True
             )
