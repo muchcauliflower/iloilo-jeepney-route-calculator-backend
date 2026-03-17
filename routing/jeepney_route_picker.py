@@ -249,6 +249,7 @@ class _PartialPath:
     accumulated_score: float
     accumulated_distance: float
     used_routes: Set[str]
+    committed_next_route: Optional[str] = None
 
     @staticmethod
     def initial(start: LatLng) -> "_PartialPath":
@@ -259,6 +260,7 @@ class _PartialPath:
             accumulated_score=0.0,
             accumulated_distance=0.0,
             used_routes=set(),
+            committed_next_route=None,
         )
 
 
@@ -896,6 +898,13 @@ class MultiJeepneyRouteFinder:
                         continue
                     if route_b.route_number in current_path.used_routes:
                         continue
+                    # If the previous transfer already committed to route_a as the
+                    # next leg, only allow it as route_a (final leg rider), not as
+                    # a connector — prevents spurious middle legs like 12→13→9
+                    # where 13 just ferries between two points on route 9.
+                    if (current_path.committed_next_route is not None
+                            and route_a.route_number != current_path.committed_next_route):
+                        continue
 
                     zone = self._closest_approach_between_routes(
                         route_a, route_b,
@@ -965,7 +974,12 @@ class MultiJeepneyRouteFinder:
                         current_location=zone.board_point,
                         accumulated_score=new_score,
                         accumulated_distance=new_distance,
+                        # Only mark route_a as fully used. route_b is recorded as
+                        # committed_next_route — the base case (final leg) can still
+                        # ride it to the destination, but the connector loop below
+                        # will skip it so it can't become a spurious middle leg.
                         used_routes=current_path.used_routes | {route_a.route_number},
+                        committed_next_route=route_b.route_number,
                     )
 
                     if debug and is_top_level:
