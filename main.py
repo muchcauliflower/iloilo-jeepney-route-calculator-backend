@@ -22,18 +22,13 @@ load_dotenv()
 
 app = FastAPI(title="Iloilo Jeepney Route Finder", version="1.0.0")
 
-# Allow React Native (Expo) dev server and production origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten in production
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# ---------------------------------------------------------------------------
-# Request / Response schemas
-# ---------------------------------------------------------------------------
 
 class RouteRequest(BaseModel):
     start_lat: float
@@ -41,10 +36,6 @@ class RouteRequest(BaseModel):
     dest_lat: float
     dest_lng: float
 
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
 
 @app.get("/health")
 def health():
@@ -66,9 +57,6 @@ def find_route(req: RouteRequest):
 
     best = build_route_response(start, dest, result)
 
-    # Build alternatives from the caches populated during the search.
-    # _last_direct_alternatives: list of (JeepneyRoute, RouteEvaluationMeta)
-    # _last_multi_alternatives:  list of MultiJeepneyRouteResult
     alternatives = []
     for alt in finder._last_direct_alternatives:
         alternatives.append(build_route_response(start, dest, alt))
@@ -77,10 +65,6 @@ def find_route(req: RouteRequest):
 
     return {"best": best, "alternatives": alternatives[:2]}
 
-
-# ---------------------------------------------------------------------------
-# Local dev entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import uvicorn

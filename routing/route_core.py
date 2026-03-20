@@ -65,6 +65,7 @@ Response shape
 import os
 import requests
 import openrouteservice
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Tuple, List, Optional
 
 from routing.jeepney_route_picker import (
@@ -277,16 +278,20 @@ def _build_segment_dict(
     meta: RouteEvaluationMeta,
     walk_from_prev: LatLng,
     walk_to_next: LatLng,
+    fetch_walks: bool = True,
 ) -> dict:
     jeepney_polyline   = [_rn_point(lat, lng) for (lat, lng) in meta.jeepney_segment]
-    walk_to_polyline   = get_walking_polyline(walk_from_prev, meta.board_point)
-    walk_from_polyline = get_walking_polyline(meta.alight_point, walk_to_next)
 
-    traffic = get_traffic_flow_for_segment(
-        jeepney_polyline=meta.jeepney_segment,
-        route_number=route_number,
-        segment_index=index,
-    )
+    if fetch_walks:
+        walk_to_polyline   = get_walking_polyline(walk_from_prev, meta.board_point)
+        walk_from_polyline = get_walking_polyline(meta.alight_point, walk_to_next)
+    else:
+        # Straight-line fallback — replaced later by parallel ORS fetch
+        walk_to_polyline   = [_rn_point(*walk_from_prev), _rn_point(*meta.board_point)]
+        walk_from_polyline = [_rn_point(*meta.alight_point), _rn_point(*walk_to_next)]
+
+    # Traffic is always deferred — never blocks the initial response
+    traffic = {"status": "disabled", "overall": None, "samples": []}
 
     return {
         "segment_index":      index,
@@ -328,29 +333,66 @@ def _build_markers(start: LatLng, dest: LatLng, segments_raw: list) -> list:
 # Public API
 # ---------------------------------------------------------------------------
 
+def _fetch_walks_parallel(segments_raw: list) -> None:
+    """
+    Replace straight-line walk polylines with real ORS-routed polylines,
+    fetching all walks concurrently.  Mutates segments_raw in-place.
+    """
+    # Build a flat list of (seg_index, key, start, end) tasks
+    tasks = []
+    for seg in segments_raw:
+        i = seg["segment_index"]
+        # walk_to: from previous location to board point
+        wt = seg["walk_to_polyline"]
+        wf = seg["walk_from_polyline"]
+        if len(wt) == 2:  # still straight-line placeholder
+            start = (wt[0]["latitude"],  wt[0]["longitude"])
+            end   = (wt[1]["latitude"],  wt[1]["longitude"])
+            tasks.append((i, "walk_to_polyline", start, end))
+        if len(wf) == 2:
+            start = (wf[0]["latitude"],  wf[0]["longitude"])
+            end   = (wf[1]["latitude"],  wf[1]["longitude"])
+            tasks.append((i, "walk_from_polyline", start, end))
+
+    if not tasks:
+        return
+
+    seg_map = {s["segment_index"]: s for s in segments_raw}
+
+    def _fetch(task):
+        idx, key, start, end = task
+        return idx, key, get_walking_polyline(start, end)
+
+    with ThreadPoolExecutor(max_workers=min(len(tasks), 8)) as executor:
+        futures = {executor.submit(_fetch, t): t for t in tasks}
+        for future in as_completed(futures):
+            try:
+                idx, key, polyline = future.result()
+                seg_map[idx][key] = polyline
+            except Exception:
+                pass  # keep straight-line on failure
+
+
 def build_route_response(
     start: LatLng,
     dest: LatLng,
     result,   # (JeepneyRoute, RouteEvaluationMeta)  OR  MultiJeepneyRouteResult
 ) -> dict:
     """
-    Convert a finder result into a JSON-serializable dict suitable for
-    both the FastAPI response and the Streamlit UI.
+    Convert a finder result into a JSON-serializable dict.
+
+    Jeepney polylines are built immediately from the algorithm output.
+    ORS walk polylines are fetched in parallel (all walks at once) so the
+    total wait is ~one ORS call instead of N sequential calls.
+    TomTom traffic is skipped entirely — not needed for rendering.
     """
 
     if isinstance(result, MultiJeepneyRouteResult):
         # ---- Transfer route ------------------------------------------------
         segments_raw = []
         for i, seg in enumerate(result.segments):
-            if i < len(result.segments) - 1:
-                next_loc = result.transfers[i].to_board_point
-            else:
-                next_loc = dest
-
-            if i == 0:
-                prev_loc = start
-            else:
-                prev_loc = result.transfers[i - 1].to_board_point
+            next_loc = result.transfers[i].to_board_point if i < len(result.segments) - 1 else dest
+            prev_loc = start if i == 0 else result.transfers[i - 1].to_board_point
 
             segment_dict = _build_segment_dict(
                 index=i,
@@ -370,6 +412,9 @@ def build_route_response(
                 segment_dict["transfer_spot_name"] = None
 
             segments_raw.append(segment_dict)
+
+        # Fetch all ORS walk polylines in parallel
+        _fetch_walks_parallel(segments_raw)
 
         return {
             "type":                "transfer",
@@ -394,6 +439,9 @@ def build_route_response(
             walk_to_next=dest,
         )
         seg["transfer_spot_name"] = None
+
+        # Fetch all ORS walk polylines in parallel
+        _fetch_walks_parallel([seg])
 
         return {
             "type":                "direct",
