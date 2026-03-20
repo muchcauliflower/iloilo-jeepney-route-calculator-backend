@@ -121,7 +121,7 @@ def get_walking_polyline(start: LatLng, end: LatLng) -> List[dict]:
 # ---------------------------------------------------------------------------
 
 # How many evenly-spaced points along the jeepney polyline to sample.
-_TRAFFIC_SAMPLE_COUNT = 5
+_TRAFFIC_SAMPLE_COUNT = 10
 
 # Congestion thresholds (currentSpeed / freeFlowSpeed ratio)
 _THRESHOLD_HEAVY    = 0.50   # < 50%  → HEAVY
@@ -377,22 +377,26 @@ def build_route_response(
     start: LatLng,
     dest: LatLng,
     result,   # (JeepneyRoute, RouteEvaluationMeta)  OR  MultiJeepneyRouteResult
+    fetch_walks: bool = True,
 ) -> dict:
     """
-    Convert a finder result into a JSON-serializable dict.
-
-    Jeepney polylines are built immediately from the algorithm output.
-    ORS walk polylines are fetched in parallel (all walks at once) so the
-    total wait is ~one ORS call instead of N sequential calls.
-    TomTom traffic is skipped entirely — not needed for rendering.
+    Convert a finder result into a JSON-serializable dict suitable for
+    both the FastAPI response and the Streamlit UI.
     """
 
     if isinstance(result, MultiJeepneyRouteResult):
         # ---- Transfer route ------------------------------------------------
         segments_raw = []
         for i, seg in enumerate(result.segments):
-            next_loc = result.transfers[i].to_board_point if i < len(result.segments) - 1 else dest
-            prev_loc = start if i == 0 else result.transfers[i - 1].to_board_point
+            if i < len(result.segments) - 1:
+                next_loc = result.transfers[i].to_board_point
+            else:
+                next_loc = dest
+
+            if i == 0:
+                prev_loc = start
+            else:
+                prev_loc = result.transfers[i - 1].to_board_point
 
             segment_dict = _build_segment_dict(
                 index=i,
@@ -401,6 +405,7 @@ def build_route_response(
                 meta=seg.meta,
                 walk_from_prev=prev_loc,
                 walk_to_next=next_loc,
+                fetch_walks=fetch_walks,
             )
 
             if i < len(result.transfers):
@@ -412,9 +417,6 @@ def build_route_response(
                 segment_dict["transfer_spot_name"] = None
 
             segments_raw.append(segment_dict)
-
-        # Fetch all ORS walk polylines in parallel
-        _fetch_walks_parallel(segments_raw)
 
         return {
             "type":                "transfer",
@@ -437,11 +439,9 @@ def build_route_response(
             meta=meta,
             walk_from_prev=start,
             walk_to_next=dest,
+            fetch_walks=fetch_walks,
         )
         seg["transfer_spot_name"] = None
-
-        # Fetch all ORS walk polylines in parallel
-        _fetch_walks_parallel([seg])
 
         return {
             "type":                "direct",
