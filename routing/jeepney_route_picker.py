@@ -600,42 +600,56 @@ class MultiJeepneyRouteFinder:
         route_a: "JeepneyRoute",
         route_b: "JeepneyRoute",
         threshold: float,
+        destination: Optional[LatLng] = None,
     ) -> "Optional[MultiJeepneyRouteFinder._GeometricTransferZone]":
-        best_dist = threshold
-        best_a: Optional[LatLng] = None
-        best_b: Optional[LatLng] = None
+        """
+        Collect all candidate transfer zones between route_a and route_b
+        within `threshold` metres, then pick the best one.
+
+        When `destination` is provided the winner minimises
+        walk_distance + dist_to_dest * 0.5 — preferring a zone that is
+        further along toward the destination even at the cost of a slightly
+        longer walk.  Without a destination the globally closest pair wins.
+        """
         coords_a = route_a.coordinates
         coords_b = route_b.coordinates
         rf = self._single_route_finder
 
+        candidates: List[Tuple[float, LatLng, LatLng]] = []  # (walk_dist, pa, pb)
+
         for pa in coords_a:
             for pb in coords_b:
                 d = self._dist(pa, pb)
-                if d < best_dist:
-                    best_dist = d
-                    best_a, best_b = pa, pb
+                if d <= threshold:
+                    candidates.append((d, pa, pb))
 
         for pa in coords_a:
             for i in range(len(coords_b) - 1):
                 d, closest = rf._point_to_segment_distance(pa, coords_b[i], coords_b[i + 1])
-                if d < best_dist:
-                    best_dist = d
-                    best_a, best_b = pa, closest
+                if d <= threshold:
+                    candidates.append((d, pa, closest))
 
         for pb in coords_b:
             for i in range(len(coords_a) - 1):
                 d, closest = rf._point_to_segment_distance(pb, coords_a[i], coords_a[i + 1])
-                if d < best_dist:
-                    best_dist = d
-                    best_a, best_b = closest, pb
+                if d <= threshold:
+                    candidates.append((d, closest, pb))
 
-        if best_a is None:
+        if not candidates:
             return None
+
+        if destination is not None:
+            def _score(c: Tuple[float, LatLng, LatLng]) -> float:
+                walk_d, _, pb = c
+                return walk_d + self._dist(pb, destination) * 0.5
+            walk_dist, best_a, best_b = min(candidates, key=_score)
+        else:
+            walk_dist, best_a, best_b = min(candidates, key=lambda c: c[0])
 
         return MultiJeepneyRouteFinder._GeometricTransferZone(
             alight_point=best_a,
             board_point=best_b,
-            walk_distance=best_dist,
+            walk_distance=walk_dist,
         )
 
     def _dist_to_destination(self, current: LatLng, dest: LatLng) -> float:
@@ -784,6 +798,7 @@ class MultiJeepneyRouteFinder:
 
                     zone = self._closest_approach_between_routes(
                         route_a, route_b, self.TRANSFER_ZONE_THRESHOLD,
+                        destination=destination,
                     )
 
                     if is_watched:
