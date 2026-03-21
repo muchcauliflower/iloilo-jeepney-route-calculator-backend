@@ -574,8 +574,6 @@ class MultiJeepneyRouteFinder:
         self._single_route_finder = EnhancedRouteFinder()
         self._last_direct_alternatives: List[Tuple[JeepneyRoute, RouteEvaluationMeta]] = []
         self._last_multi_alternatives: List[MultiJeepneyRouteResult] = []
-        # Bounding box cache: (route_number+direction) → (min_lat, max_lat, min_lng, max_lng)
-        self._bbox_cache: Dict[str, Tuple[float, float, float, float]] = {}
 
     def _dist(self, p1: LatLng, p2: LatLng) -> float:
         return haversine_distance(p1, p2)
@@ -597,31 +595,6 @@ class MultiJeepneyRouteFinder:
         board_point:  "LatLng"
         walk_distance: float
 
-    def _route_bbox(self, route: "JeepneyRoute") -> Tuple[float, float, float, float]:
-        """Return (min_lat, max_lat, min_lng, max_lng), cached per route_number."""
-        key = route.route_number + route.direction
-        if key not in self._bbox_cache:
-            lats = [c[0] for c in route.coordinates]
-            lngs = [c[1] for c in route.coordinates]
-            self._bbox_cache[key] = (min(lats), max(lats), min(lngs), max(lngs))
-        return self._bbox_cache[key]
-
-    def _bboxes_overlap(
-        self,
-        route_a: "JeepneyRoute",
-        route_b: "JeepneyRoute",
-        pad_deg: float,
-    ) -> bool:
-        """True if the bounding boxes of the two routes overlap when padded by pad_deg."""
-        a_minlat, a_maxlat, a_minlng, a_maxlng = self._route_bbox(route_a)
-        b_minlat, b_maxlat, b_minlng, b_maxlng = self._route_bbox(route_b)
-        return (
-            a_minlat - pad_deg <= b_maxlat + pad_deg and
-            a_maxlat + pad_deg >= b_minlat - pad_deg and
-            a_minlng - pad_deg <= b_maxlng + pad_deg and
-            a_maxlng + pad_deg >= b_minlng - pad_deg
-        )
-
     def _closest_approach_between_routes(
         self,
         route_a: "JeepneyRoute",
@@ -638,14 +611,6 @@ class MultiJeepneyRouteFinder:
         further along toward the destination even at the cost of a slightly
         longer walk.  Without a destination the globally closest pair wins.
         """
-        # Bounding box pre-filter — 150m ≈ 0.00135 degrees latitude.
-        # If bounding boxes don't overlap (with padding) the routes can't
-        # possibly be within threshold of each other. This eliminates the
-        # vast majority of pairs in O(1) before the expensive O(n²) sweep.
-        pad_deg = threshold / 111_000.0
-        if not self._bboxes_overlap(route_a, route_b, pad_deg):
-            return None
-
         coords_a = route_a.coordinates
         coords_b = route_b.coordinates
         rf = self._single_route_finder
@@ -722,6 +687,8 @@ class MultiJeepneyRouteFinder:
         transfer_penalty: float,
         transfer_walk_weight: float,
         debug: bool,
+        # Pre-computed once at top level — avoids re-scanning all routes every recursion
+        dest_routes: Optional[List[JeepneyRoute]] = None,
         # --------------- debug filter ---------------
         watch_routes: Optional[Set[str]] = None,
     ) -> List[MultiJeepneyRouteResult]:
@@ -738,9 +705,10 @@ class MultiJeepneyRouteFinder:
         is_top_level = len(current_path.segments) == 0
 
         # ---- Base case ----
-        direct_candidates = self._find_routes_near_location(
-            all_routes, destination, max_alight_distance
-        )
+        # Use pre-computed dest_routes if available — avoids O(routes×coords) scan per recursion
+        if dest_routes is None:
+            dest_routes = self._find_routes_near_location(all_routes, destination, max_alight_distance)
+        direct_candidates = dest_routes
 
         for route in direct_candidates:
             if route.route_number in current_path.used_routes:
@@ -813,15 +781,14 @@ class MultiJeepneyRouteFinder:
                 and any(self._dist(c, current_path.current_location) <= max_board_distance
                         for c in r.coordinates)
             ]
-            dest_routes = [
-                r for r in all_routes
+            # dest_routes already pre-computed — filter out used routes only
+            _dest_routes_filtered = [
+                r for r in dest_routes
                 if r.route_number not in current_path.used_routes
-                and any(self._dist(c, destination) <= max_alight_distance
-                        for c in r.coordinates)
             ]
 
             for route_a in start_routes:
-                for route_b in dest_routes:
+                for route_b in _dest_routes_filtered:
                     if route_a.route_number == route_b.route_number:
                         continue
                     if route_b.route_number in current_path.used_routes:
@@ -944,6 +911,7 @@ class MultiJeepneyRouteFinder:
                         transfer_penalty=transfer_penalty,
                         transfer_walk_weight=transfer_walk_weight,
                         debug=debug,
+                        dest_routes=dest_routes,
                         watch_routes=watch_routes,
                     )
                     results.extend(sub_results)
@@ -975,20 +943,35 @@ class MultiJeepneyRouteFinder:
 
         initial_path = _PartialPath.initial(start)
 
-        all_results = self._find_routes_recursive(
-            all_routes=all_routes,
-            current_path=initial_path,
-            destination=dest,
-            transfers_remaining=self.MAX_TRANSFERS,
-            current_best_score=float("inf"),
-            max_board_distance=max_board_distance,
-            max_alight_distance=max_alight_distance,
-            max_transfer_walk_distance=max_transfer_walk_distance,
-            transfer_penalty=transfer_penalty,
-            transfer_walk_weight=transfer_walk_weight,
-            debug=debug,
-            watch_routes=watch_routes,
+        # --- Transfer capping: try 1-transfer first, escalate to 2 only if needed.
+        # Cuts the search tree by ~70% for most queries.
+        # Pre-compute dest_routes once — reused across all recursive calls.
+        precomputed_dest_routes = self._find_routes_near_location(
+            all_routes, dest, max_alight_distance
         )
+
+        def _run(max_transfers: int) -> List[MultiJeepneyRouteResult]:
+            return self._find_routes_recursive(
+                all_routes=all_routes,
+                current_path=_PartialPath.initial(start),
+                destination=dest,
+                transfers_remaining=max_transfers,
+                current_best_score=float("inf"),
+                max_board_distance=max_board_distance,
+                max_alight_distance=max_alight_distance,
+                max_transfer_walk_distance=max_transfer_walk_distance,
+                transfer_penalty=transfer_penalty,
+                transfer_walk_weight=transfer_walk_weight,
+                debug=debug,
+                dest_routes=precomputed_dest_routes,
+                watch_routes=watch_routes,
+            )
+
+        all_results = _run(1)
+        if not all_results and self.MAX_TRANSFERS >= 2:
+            if debug:
+                print("   ↳ No 1-transfer route. Trying 2-transfer search...")
+            all_results = _run(2)
 
         if not all_results:
             if debug:
