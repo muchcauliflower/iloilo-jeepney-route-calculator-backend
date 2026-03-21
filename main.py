@@ -107,12 +107,12 @@ def find_route(req: RouteRequest):
         result = finder.find_best_route_with_transfer(routes, start, dest, debug=False)
 
         if result is None:
-            yield json.dumps({"type": "error", "detail": "No route found within walking limits."}) + "\n"
+            yield json.dumps({"event": "error", "detail": "No route found within walking limits."}) + "\n"
             return
 
         # Stream best route immediately
         best = build_route_response(start, dest, result)
-        yield json.dumps({"type": "best", **best}) + "\n"
+        yield json.dumps({"event": "best", "route": best}) + "\n"
 
         # Stream alternatives as they're built
         alts = []
@@ -122,9 +122,9 @@ def find_route(req: RouteRequest):
             alts.append(build_route_response(start, dest, alt))
 
         for alt in alts[:2]:
-            yield json.dumps({"type": "alternative", **alt}) + "\n"
+            yield json.dumps({"event": "alternative", "route": alt}) + "\n"
 
-        yield json.dumps({"type": "done"}) + "\n"
+        yield json.dumps({"event": "done"}) + "\n"
 
     return StreamingResponse(_stream(), media_type="application/x-ndjson")
 
