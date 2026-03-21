@@ -574,6 +574,8 @@ class MultiJeepneyRouteFinder:
         self._single_route_finder = EnhancedRouteFinder()
         self._last_direct_alternatives: List[Tuple[JeepneyRoute, RouteEvaluationMeta]] = []
         self._last_multi_alternatives: List[MultiJeepneyRouteResult] = []
+        # Bounding box cache: (route_number+direction) → (min_lat, max_lat, min_lng, max_lng)
+        self._bbox_cache: Dict[str, Tuple[float, float, float, float]] = {}
 
     def _dist(self, p1: LatLng, p2: LatLng) -> float:
         return haversine_distance(p1, p2)
@@ -595,6 +597,31 @@ class MultiJeepneyRouteFinder:
         board_point:  "LatLng"
         walk_distance: float
 
+    def _route_bbox(self, route: "JeepneyRoute") -> Tuple[float, float, float, float]:
+        """Return (min_lat, max_lat, min_lng, max_lng), cached per route_number."""
+        key = route.route_number + route.direction
+        if key not in self._bbox_cache:
+            lats = [c[0] for c in route.coordinates]
+            lngs = [c[1] for c in route.coordinates]
+            self._bbox_cache[key] = (min(lats), max(lats), min(lngs), max(lngs))
+        return self._bbox_cache[key]
+
+    def _bboxes_overlap(
+        self,
+        route_a: "JeepneyRoute",
+        route_b: "JeepneyRoute",
+        pad_deg: float,
+    ) -> bool:
+        """True if the bounding boxes of the two routes overlap when padded by pad_deg."""
+        a_minlat, a_maxlat, a_minlng, a_maxlng = self._route_bbox(route_a)
+        b_minlat, b_maxlat, b_minlng, b_maxlng = self._route_bbox(route_b)
+        return (
+            a_minlat - pad_deg <= b_maxlat + pad_deg and
+            a_maxlat + pad_deg >= b_minlat - pad_deg and
+            a_minlng - pad_deg <= b_maxlng + pad_deg and
+            a_maxlng + pad_deg >= b_minlng - pad_deg
+        )
+
     def _closest_approach_between_routes(
         self,
         route_a: "JeepneyRoute",
@@ -611,6 +638,14 @@ class MultiJeepneyRouteFinder:
         further along toward the destination even at the cost of a slightly
         longer walk.  Without a destination the globally closest pair wins.
         """
+        # Bounding box pre-filter — 150m ≈ 0.00135 degrees latitude.
+        # If bounding boxes don't overlap (with padding) the routes can't
+        # possibly be within threshold of each other. This eliminates the
+        # vast majority of pairs in O(1) before the expensive O(n²) sweep.
+        pad_deg = threshold / 111_000.0
+        if not self._bboxes_overlap(route_a, route_b, pad_deg):
+            return None
+
         coords_a = route_a.coordinates
         coords_b = route_b.coordinates
         rf = self._single_route_finder
