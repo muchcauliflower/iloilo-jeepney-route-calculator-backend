@@ -10,18 +10,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Set
 
-# ---------------------------------------------------------------------------
-# Type alias: coordinates are always (lat, lng) tuples
-# ---------------------------------------------------------------------------
 LatLng = Tuple[float, float]
 
 
-# ---------------------------------------------------------------------------
-# Fast geometry helpers  (replaces geopy.geodesic — ~50-100x faster)
-# ---------------------------------------------------------------------------
-
 def haversine_distance(p1: LatLng, p2: LatLng) -> float:
-    """Haversine distance in metres. Port of the Dart Distance() call."""
     R = 6_371_000.0
     lat1, lon1 = math.radians(p1[0]), math.radians(p1[1])
     lat2, lon2 = math.radians(p2[0]), math.radians(p2[1])
@@ -32,7 +24,6 @@ def haversine_distance(p1: LatLng, p2: LatLng) -> float:
 
 
 def calculate_bearing(p1: LatLng, p2: LatLng) -> float:
-    """Forward bearing in degrees [0, 360). Port of the Dart bearing utility."""
     lat1, lon1 = math.radians(p1[0]), math.radians(p1[1])
     lat2, lon2 = math.radians(p2[0]), math.radians(p2[1])
     d_lon = lon2 - lon1
@@ -42,14 +33,9 @@ def calculate_bearing(p1: LatLng, p2: LatLng) -> float:
 
 
 def is_forward(route_bearing: float, target_bearing: float, tolerance: float = 60.0) -> bool:
-    """True when the route is heading toward the target. Port of Dart isForward."""
     diff = (route_bearing - target_bearing + 540) % 360 - 180
     return abs(diff) <= tolerance
 
-
-# ---------------------------------------------------------------------------
-# Data Models  (route_loader equivalent)
-# ---------------------------------------------------------------------------
 
 @dataclass
 class JeepneyRoute:
@@ -57,10 +43,6 @@ class JeepneyRoute:
     direction: str
     coordinates: List[LatLng]
 
-
-# ---------------------------------------------------------------------------
-# Models from route_finder.dart
-# ---------------------------------------------------------------------------
 
 @dataclass
 class DirectionStep:
@@ -136,7 +118,7 @@ class DestinationCandidate:
     point: LatLng
     index: int
     distance: float
-    type: str  # 'node' or 'segment'
+    type: str
 
 
 @dataclass
@@ -145,7 +127,7 @@ class BoardingCandidate:
     index: int
     actual_distance: float
     effective_distance: float
-    type: str  # 'node' or 'segment'
+    type: str
 
 
 @dataclass
@@ -186,10 +168,6 @@ class EnhancedRouteResult:
         minutes = self.total_duration_s / 60
         return f"{minutes:.0f} min"
 
-
-# ---------------------------------------------------------------------------
-# Models from multi_jeepney_route_finder.dart
-# ---------------------------------------------------------------------------
 
 @dataclass
 class TransferSpot:
@@ -262,41 +240,26 @@ class _PartialPath:
         )
 
 
-# ---------------------------------------------------------------------------
-# EnhancedRouteFinder  (route_finder.dart)
-# ---------------------------------------------------------------------------
-
 class EnhancedRouteFinder:
 
     @staticmethod
     def _dist(p1: LatLng, p2: LatLng) -> float:
         return haversine_distance(p1, p2)
 
-    # ------------------------------------------------------------------
-    # Point-to-segment closest point & distance
-    # ------------------------------------------------------------------
     def _point_to_segment_distance(
         self, point: LatLng, seg_start: LatLng, seg_end: LatLng
     ) -> Tuple[float, LatLng]:
-        """Returns (distance_m, closest_point_on_segment)."""
-        px, py = point[1], point[0]          # lng, lat
+        px, py = point[1], point[0]
         x1, y1 = seg_start[1], seg_start[0]
         x2, y2 = seg_end[1], seg_end[0]
-
         dx, dy = x2 - x1, y2 - y1
-
         if dx == 0 and dy == 0:
             return self._dist(point, seg_start), seg_start
-
         t = ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)
         t = max(0.0, min(1.0, t))
-
         closest: LatLng = (y1 + t * dy, x1 + t * dx)
         return self._dist(point, closest), closest
 
-    # ------------------------------------------------------------------
-    # Find all destination candidates within maxAlightDistance
-    # ------------------------------------------------------------------
     def _find_all_nearby_destination_candidates(
         self,
         route_coords: List[LatLng],
@@ -304,25 +267,17 @@ class EnhancedRouteFinder:
         max_alight_distance: float,
     ) -> List[DestinationCandidate]:
         candidates: List[DestinationCandidate] = []
-
-        # Nodes
         for i, coord in enumerate(route_coords):
             d = self._dist(coord, dest)
             if d <= max_alight_distance:
                 candidates.append(DestinationCandidate(point=coord, index=i, distance=d, type="node"))
-
-        # Interpolated segment points
         for i in range(len(route_coords) - 1):
             d, closest = self._point_to_segment_distance(dest, route_coords[i], route_coords[i + 1])
             if d <= max_alight_distance:
                 candidates.append(DestinationCandidate(point=closest, index=i, distance=d, type="segment"))
-
         candidates.sort(key=lambda c: c.distance)
         return candidates
 
-    # ------------------------------------------------------------------
-    # Direction penalty score
-    # ------------------------------------------------------------------
     def _calculate_direction_score(
         self,
         route_coords: List[LatLng],
@@ -332,22 +287,16 @@ class EnhancedRouteFinder:
     ) -> float:
         if board_idx >= len(route_coords) - 1:
             return 0.0
-
         segments_to_check = min(10, dest_idx - board_idx)
         if segments_to_check < 2:
             return 0.0
-
         initial_dist = self._dist(route_coords[board_idx], dest_point)
         check_idx = min(board_idx + segments_to_check, len(route_coords) - 1)
         later_dist = self._dist(route_coords[check_idx], dest_point)
-
         if later_dist > initial_dist:
             return (later_dist - initial_dist) * 2.0
         return 0.0
 
-    # ------------------------------------------------------------------
-    # Find best boarding point before destination index
-    # ------------------------------------------------------------------
     def _find_best_boarding_point_before_destination(
         self,
         route_coords: List[LatLng],
@@ -358,8 +307,6 @@ class EnhancedRouteFinder:
         consider_direction: bool,
     ) -> Optional[BoardingCandidate]:
         candidates: List[BoardingCandidate] = []
-
-        # Check all nodes before destination
         for i in range(dest_idx):
             coord = route_coords[i]
             d = self._dist(start, coord)
@@ -374,8 +321,6 @@ class EnhancedRouteFinder:
                     effective_distance=d + penalty,
                     type="node",
                 ))
-
-        # Check all segments before destination
         for i in range(dest_idx):
             if i + 1 >= len(route_coords):
                 continue
@@ -391,44 +336,30 @@ class EnhancedRouteFinder:
                     effective_distance=d + penalty,
                     type="segment",
                 ))
-
         if not candidates:
             return None
-
         candidates.sort(key=lambda c: c.effective_distance)
         return candidates[0]
 
-    # ------------------------------------------------------------------
-    # Nearest node on route
-    # ------------------------------------------------------------------
     def _nearest_point_on_route(
         self, route_coords: List[LatLng], point: LatLng
     ) -> Tuple[LatLng, int, float]:
-        """Returns (closest_point, index, distance)."""
         min_dist = float("inf")
         min_idx = 0
         min_pt = route_coords[0]
-
         for i, coord in enumerate(route_coords):
             d = self._dist(coord, point)
             if d < min_dist:
                 min_dist = d
                 min_idx = i
                 min_pt = coord
-
         return min_pt, min_idx, min_dist
 
-    # ------------------------------------------------------------------
-    # Path distance helper
-    # ------------------------------------------------------------------
     def _calculate_path_distance(self, coords: List[LatLng]) -> float:
         if len(coords) < 2:
             return 0.0
         return sum(self._dist(coords[k], coords[k + 1]) for k in range(len(coords) - 1))
 
-    # ------------------------------------------------------------------
-    # Main evaluation (with loop/interpolation support)
-    # ------------------------------------------------------------------
     def evaluate_route(
         self,
         route_coords: List[LatLng],
@@ -450,7 +381,6 @@ class EnhancedRouteFinder:
 
         best_solution: Optional[RouteEvaluationMeta] = None
         best_score = float("inf")
-
         ref_pt, ref_board_idx, _ = self._nearest_point_on_route(route_coords, start)
 
         for dest_candidate in dest_candidates:
@@ -462,7 +392,6 @@ class EnhancedRouteFinder:
             if board_candidate is None:
                 continue
 
-            # Build jeepney segment
             jeepney_segment: List[LatLng] = (
                 [board_candidate.point]
                 + route_coords[board_candidate.index + 1: dest_candidate.index + 1]
@@ -479,7 +408,6 @@ class EnhancedRouteFinder:
 
             if score < best_score:
                 best_score = score
-
                 _, closest_board_idx, closest_board_dist = self._nearest_point_on_route(
                     route_coords[: dest_candidate.index], start
                 )
@@ -487,7 +415,6 @@ class EnhancedRouteFinder:
                     board_candidate.index != closest_board_idx
                     and board_candidate.actual_distance > closest_board_dist + 10
                 )
-
                 best_solution = RouteEvaluationMeta(
                     board_point=board_candidate.point,
                     board_idx=board_candidate.index,
@@ -509,9 +436,6 @@ class EnhancedRouteFinder:
 
         return best_solution
 
-    # ------------------------------------------------------------------
-    # Find best route across all routes
-    # ------------------------------------------------------------------
     def find_best_route(
         self,
         routes: List[JeepneyRoute],
@@ -525,6 +449,7 @@ class EnhancedRouteFinder:
         best_route: Optional[JeepneyRoute] = None
         best_meta: Optional[RouteEvaluationMeta] = None
         best_score = float("inf")
+        best_per_route_number: Dict[str, Tuple[JeepneyRoute, RouteEvaluationMeta]] = {}
 
         if debug:
             print(f"\n🔍 Evaluating {len(routes)} jeepney routes with loop support...\n")
@@ -564,6 +489,10 @@ class EnhancedRouteFinder:
                 print(f"     Alight idx={meta.alight_idx} dist={meta.alight_dist_m:.1f}m")
                 print(f"     Jeepney ride distance={meta.jeepney_dist_m:.1f}m")
 
+            existing = best_per_route_number.get(route.route_number)
+            if existing is None or meta.score < existing[1].score:
+                best_per_route_number[route.route_number] = (route, meta)
+
             if meta.score < best_score:
                 best_score = meta.score
                 best_route = route
@@ -586,11 +515,16 @@ class EnhancedRouteFinder:
             print(f"   Board dist: {best_meta.board_dist_m:.1f}m | Alight dist: {best_meta.alight_dist_m:.1f}m")
             print(f"   Jeepney dist: {best_meta.jeepney_dist_m:.1f}m | Score: {best_meta.score:.1f}")
 
+        self._last_direct_alternatives = sorted(
+            [
+                (r, m) for rn, (r, m) in best_per_route_number.items()
+                if rn != best_route.route_number
+            ],
+            key=lambda x: x[1].score,
+        )[:2]
+
         return best_route, best_meta
 
-    # ------------------------------------------------------------------
-    # Boarding zone polygon
-    # ------------------------------------------------------------------
     def create_boarding_zone_polygon(
         self,
         route_coords: List[LatLng],
@@ -602,17 +536,13 @@ class EnhancedRouteFinder:
         start_idx = max(0, center_idx - nodes_before)
         end_idx = min(len(route_coords) - 1, center_idx + nodes_after)
         segment = route_coords[start_idx: end_idx + 1]
-
         if len(segment) < 2:
             return None
-
         left_side: List[LatLng] = []
         right_side: List[LatLng] = []
         meters_to_deg = buffer_width / 111000
-
         for i, pt in enumerate(segment):
             lat, lon = pt
-
             if i == 0:
                 nxt = segment[i + 1]
                 angle = math.atan2(nxt[0] - lat, nxt[1] - lon)
@@ -622,20 +552,13 @@ class EnhancedRouteFinder:
             else:
                 prv, nxt = segment[i - 1], segment[i + 1]
                 angle = math.atan2(nxt[0] - prv[0], nxt[1] - prv[1])
-
             perp_angle = angle + math.pi / 2
             offset_lon = meters_to_deg * math.cos(perp_angle) / math.cos(math.radians(lat))
             offset_lat = meters_to_deg * math.sin(perp_angle)
-
             left_side.append((lat + offset_lat, lon + offset_lon))
             right_side.append((lat - offset_lat, lon - offset_lon))
-
         return left_side + list(reversed(right_side))
 
-
-# ---------------------------------------------------------------------------
-# MultiJeepneyRouteFinder  (multi_jeepney_route_finder.dart)
-# ---------------------------------------------------------------------------
 
 class MultiJeepneyRouteFinder:
 
@@ -643,25 +566,15 @@ class MultiJeepneyRouteFinder:
     MAX_TOTAL_DURATION_MINUTES = 120.0
     MAX_TOTAL_WALK_DISTANCE = 1000.0
     PRUNING_THRESHOLD_MULTIPLIER = 1.5
+    WALK_SPEED = 1.4
+    JEEPNEY_SPEED = 5.56
+    TRANSFER_ZONE_THRESHOLD = 150.0
 
-    WALK_SPEED = 1.4    # m/s
-    JEEPNEY_SPEED = 5.56  # m/s (~20 km/h)
-
-    def __init__(self, transfer_spots: Optional[List[TransferSpot]] = None):
-        self._transfer_spots: List[TransferSpot] = transfer_spots or []
+    def __init__(self):
         self._single_route_finder = EnhancedRouteFinder()
+        self._last_direct_alternatives: List[Tuple[JeepneyRoute, RouteEvaluationMeta]] = []
+        self._last_multi_alternatives: List[MultiJeepneyRouteResult] = []
 
-    def load_transfer_spots(self, path: str) -> None:
-        try:
-            with open(path, "r") as f:
-                data = json.load(f)
-            self._transfer_spots = [TransferSpot.from_json(d) for d in data]
-            print(f"✅ Loaded {len(self._transfer_spots)} transfer spots")
-        except Exception as e:
-            print(f"❌ Error loading transfer spots: {e}")
-            self._transfer_spots = []
-
-    # ------------------------------------------------------------------
     def _dist(self, p1: LatLng, p2: LatLng) -> float:
         return haversine_distance(p1, p2)
 
@@ -676,23 +589,72 @@ class MultiJeepneyRouteFinder:
                     break
         return nearby
 
-    def _find_transfer_spots_for_route(
-        self, route: JeepneyRoute, max_distance_from_route: float
-    ) -> List[TransferSpot]:
-        accessible = []
-        for spot in self._transfer_spots:
-            if route.route_number not in spot.routes:
-                continue
-            for coord in route.coordinates:
-                if self._dist(coord, spot.location) <= max_distance_from_route:
-                    accessible.append(spot)
-                    break
-        return accessible
+    @dataclass
+    class _GeometricTransferZone:
+        alight_point: "LatLng"
+        board_point:  "LatLng"
+        walk_distance: float
+
+    def _closest_approach_between_routes(
+        self,
+        route_a: "JeepneyRoute",
+        route_b: "JeepneyRoute",
+        threshold: float,
+        destination: Optional[LatLng] = None,
+    ) -> "Optional[MultiJeepneyRouteFinder._GeometricTransferZone]":
+        """
+        Collect all candidate transfer zones between route_a and route_b
+        within `threshold` metres, then pick the best one.
+
+        When `destination` is provided the winner minimises
+        walk_distance + dist_to_dest * 0.5 — preferring a zone that is
+        further along toward the destination even at the cost of a slightly
+        longer walk.  Without a destination the globally closest pair wins.
+        """
+        coords_a = route_a.coordinates
+        coords_b = route_b.coordinates
+        rf = self._single_route_finder
+
+        candidates: List[Tuple[float, LatLng, LatLng]] = []  # (walk_dist, pa, pb)
+
+        for pa in coords_a:
+            for pb in coords_b:
+                d = self._dist(pa, pb)
+                if d <= threshold:
+                    candidates.append((d, pa, pb))
+
+        for pa in coords_a:
+            for i in range(len(coords_b) - 1):
+                d, closest = rf._point_to_segment_distance(pa, coords_b[i], coords_b[i + 1])
+                if d <= threshold:
+                    candidates.append((d, pa, closest))
+
+        for pb in coords_b:
+            for i in range(len(coords_a) - 1):
+                d, closest = rf._point_to_segment_distance(pb, coords_a[i], coords_a[i + 1])
+                if d <= threshold:
+                    candidates.append((d, closest, pb))
+
+        if not candidates:
+            return None
+
+        if destination is not None:
+            def _score(c: Tuple[float, LatLng, LatLng]) -> float:
+                walk_d, _, pb = c
+                return walk_d + self._dist(pb, destination) * 0.5
+            walk_dist, best_a, best_b = min(candidates, key=_score)
+        else:
+            walk_dist, best_a, best_b = min(candidates, key=lambda c: c[0])
+
+        return MultiJeepneyRouteFinder._GeometricTransferZone(
+            alight_point=best_a,
+            board_point=best_b,
+            walk_distance=walk_dist,
+        )
 
     def _dist_to_destination(self, current: LatLng, dest: LatLng) -> float:
         return self._dist(current, dest)
 
-    # ------------------------------------------------------------------
     def _estimate_total_duration(
         self,
         path: _PartialPath,
@@ -712,7 +674,6 @@ class MultiJeepneyRouteFinder:
         duration += final_transfer_walk / self.WALK_SPEED
         return duration
 
-    # ------------------------------------------------------------------
     def _find_routes_recursive(
         self,
         all_routes: List[JeepneyRoute],
@@ -726,24 +687,22 @@ class MultiJeepneyRouteFinder:
         transfer_penalty: float,
         transfer_walk_weight: float,
         debug: bool,
+        # --------------- debug filter ---------------
+        watch_routes: Optional[Set[str]] = None,
     ) -> List[MultiJeepneyRouteResult]:
         results: List[MultiJeepneyRouteResult] = []
 
-        # PRUNING 1: score already too high
         if current_path.accumulated_score > current_best_score * self.PRUNING_THRESHOLD_MULTIPLIER:
             return results
 
-        # PRUNING 2: total walking exceeds limit
         total_walking = sum(t.walk_distance for t in current_path.transfers)
         if total_walking > self.MAX_TOTAL_WALK_DISTANCE:
             return results
 
-        # PRUNING 3: geographical progress check
         current_dist_to_dest = self._dist_to_destination(current_path.current_location, destination)
-
         is_top_level = len(current_path.segments) == 0
 
-        # ---- Base case: try direct route to destination ----
+        # ---- Base case ----
         direct_candidates = self._find_routes_near_location(
             all_routes, destination, max_alight_distance
         )
@@ -764,19 +723,34 @@ class MultiJeepneyRouteFinder:
                 max_board_distance=board_dist,
                 max_alight_distance=max_alight_distance,
             )
+
+            # ── WATCH debug: log every attempt at the base case ──
+            if watch_routes and route.route_number in watch_routes and not is_top_level:
+                seg_history = " → ".join(s.route.route_number for s in current_path.segments)
+                print(
+                    f"  👁  BASE CASE  [{seg_history}] → {route.route_number}\n"
+                    f"       current_location : {current_path.current_location}\n"
+                    f"       board_dist limit : {board_dist:.0f}m\n"
+                    f"       evaluate_route   : {'✅ SUCCESS' if meta else '❌ FAILED (None)'}"
+                )
+                if meta:
+                    print(
+                        f"       board_dist_m     : {meta.board_dist_m:.1f}m\n"
+                        f"       jeepney_dist_m   : {meta.jeepney_dist_m:.1f}m\n"
+                        f"       alight_dist_m    : {meta.alight_dist_m:.1f}m\n"
+                        f"       score            : {meta.score:.1f}"
+                    )
+
             if meta is None:
                 continue
 
             final_score = current_path.accumulated_score + meta.score
             final_distance = (
                 current_path.accumulated_distance
-                + meta.board_dist_m
-                + meta.jeepney_dist_m
-                + meta.alight_dist_m
+                + meta.board_dist_m + meta.jeepney_dist_m + meta.alight_dist_m
             )
             final_duration = self._estimate_total_duration(current_path, meta, 0)
 
-            # PRUNING 4: max duration
             if final_duration > self.MAX_TOTAL_DURATION_MINUTES * 60:
                 continue
 
@@ -784,7 +758,6 @@ class MultiJeepneyRouteFinder:
                 MultiRouteSegment(route=route, meta=meta,
                                   segment_order=len(current_path.segments) + 1)
             ]
-
             results.append(MultiJeepneyRouteResult(
                 segments=segments,
                 transfers=list(current_path.transfers),
@@ -797,78 +770,132 @@ class MultiJeepneyRouteFinder:
                 route_str = " → ".join(s.route.route_number for s in segments)
                 print(f"   ✅ Found path: {route_str} ({final_duration / 60:.0f}min)")
 
-        # ---- Recursive case: try adding a transfer ----
+        # ---- Recursive case ----
         if transfers_remaining > 0:
-            for transfer_spot in self._transfer_spots:
-                candidate_routes = [
-                    r for r in all_routes
-                    if r.route_number not in current_path.used_routes
-                    and r.route_number in transfer_spot.routes
-                ]
-                if not candidate_routes:
-                    continue
+            start_routes = [
+                r for r in all_routes
+                if r.route_number not in current_path.used_routes
+                and any(self._dist(c, current_path.current_location) <= max_board_distance
+                        for c in r.coordinates)
+            ]
+            dest_routes = [
+                r for r in all_routes
+                if r.route_number not in current_path.used_routes
+                and any(self._dist(c, destination) <= max_alight_distance
+                        for c in r.coordinates)
+            ]
 
-                for route in candidate_routes:
+            for route_a in start_routes:
+                for route_b in dest_routes:
+                    if route_a.route_number == route_b.route_number:
+                        continue
+                    if route_b.route_number in current_path.used_routes:
+                        continue
+
+                    is_watched = (watch_routes and
+                                  route_a.route_number in watch_routes and
+                                  route_b.route_number in watch_routes)
+
+                    zone = self._closest_approach_between_routes(
+                        route_a, route_b, self.TRANSFER_ZONE_THRESHOLD,
+                        destination=destination,
+                    )
+
+                    if is_watched:
+                        seg_history = (" → ".join(s.route.route_number for s in current_path.segments)
+                                       or "START")
+                        print(f"\n  👁  ZONE CHECK  [{seg_history}] {route_a.route_number} → {route_b.route_number}")
+                        if zone is None:
+                            print(f"       zone             : ❌ None (no approach within {self.TRANSFER_ZONE_THRESHOLD:.0f}m threshold)")
+                            continue
+                        print(
+                            f"       zone.alight_pt   : {zone.alight_point}\n"
+                            f"       zone.board_pt    : {zone.board_point}\n"
+                            f"       zone.walk_dist   : {zone.walk_distance:.1f}m  (max={max_transfer_walk_distance:.0f}m)"
+                        )
+
+                    if zone is None:
+                        continue
+                    if zone.walk_distance > max_transfer_walk_distance:
+                        if is_watched:
+                            print(f"       ❌ REJECTED: walk_dist {zone.walk_distance:.1f}m > max {max_transfer_walk_distance:.0f}m")
+                        continue
+
+                    new_dist_to_dest = self._dist_to_destination(zone.board_point, destination)
+                    if new_dist_to_dest >= current_dist_to_dest * 1.3:
+                        if is_watched:
+                            print(f"       ❌ REJECTED: no progress — new_dist {new_dist_to_dest:.0f}m >= {current_dist_to_dest * 1.3:.0f}m")
+                        continue
+
                     board_dist = (
                         max_board_distance if not current_path.segments
                         else max_transfer_walk_distance
                     )
 
                     meta = self._single_route_finder.evaluate_route(
-                        route.coordinates,
+                        route_a.coordinates,
                         current_path.current_location,
-                        transfer_spot.location,
+                        zone.alight_point,
                         max_board_distance=board_dist,
                         max_alight_distance=max_transfer_walk_distance,
                     )
-                    if meta is None:
-                        continue
 
-                    transfer_walk_dist = self._dist(meta.alight_point, transfer_spot.location)
-                    if transfer_walk_dist > max_transfer_walk_distance:
+                    if is_watched:
+                        print(
+                            f"       evaluate_route   : {'✅ SUCCESS' if meta else '❌ FAILED (None)'}\n"
+                            f"       board_dist limit : {board_dist:.0f}m"
+                        )
+                        if meta:
+                            print(
+                                f"       board_dist_m     : {meta.board_dist_m:.1f}m\n"
+                                f"       jeepney_dist_m   : {meta.jeepney_dist_m:.1f}m\n"
+                                f"       score so far     : {current_path.accumulated_score + meta.score:.1f}"
+                            )
+
+                    if meta is None:
                         continue
 
                     new_score = (
                         current_path.accumulated_score
                         + meta.score
-                        + transfer_walk_dist * transfer_walk_weight
+                        + zone.walk_distance * transfer_walk_weight
                         + transfer_penalty
                     )
                     new_distance = (
                         current_path.accumulated_distance
-                        + meta.board_dist_m
-                        + meta.jeepney_dist_m
-                        + meta.alight_dist_m
-                        + transfer_walk_dist
+                        + meta.board_dist_m + meta.jeepney_dist_m
+                        + meta.alight_dist_m + zone.walk_distance
                     )
 
-                    # PRUNING 5: must be making progress toward destination
-                    new_dist_to_dest = self._dist_to_destination(transfer_spot.location, destination)
-                    if new_dist_to_dest >= current_dist_to_dest * 1.3:
-                        continue
-
+                    synthetic_spot = TransferSpot(
+                        name=f"{route_a.route_number}↔{route_b.route_number} zone",
+                        location=zone.board_point,
+                        routes=[route_a.route_number, route_b.route_number],
+                        priority="geometric",
+                    )
                     new_segment = MultiRouteSegment(
-                        route=route, meta=meta,
+                        route=route_a, meta=meta,
                         segment_order=len(current_path.segments) + 1,
                     )
                     new_transfer = TransferConnection(
-                        transfer_spot=transfer_spot,
+                        transfer_spot=synthetic_spot,
                         from_segment=new_segment,
                         from_alight_point=meta.alight_point,
-                        to_board_point=transfer_spot.location,
-                        walk_distance=transfer_walk_dist,
+                        to_board_point=zone.board_point,
+                        walk_distance=zone.walk_distance,
                     )
                     new_path = _PartialPath(
                         segments=current_path.segments + [new_segment],
                         transfers=current_path.transfers + [new_transfer],
-                        current_location=transfer_spot.location,
+                        current_location=zone.board_point,
                         accumulated_score=new_score,
                         accumulated_distance=new_distance,
-                        used_routes=current_path.used_routes | {route.route_number},
+                        used_routes=current_path.used_routes | {route_a.route_number},
                     )
 
                     if debug and is_top_level:
-                        print(f"   🔄 Trying: {route.route_number} → {transfer_spot.name}")
+                        print(f"   🔄 Geometric transfer: {route_a.route_number} → {route_b.route_number}"
+                              f" (walk {zone.walk_distance:.0f}m)")
 
                     sub_results = self._find_routes_recursive(
                         all_routes=all_routes,
@@ -882,12 +909,12 @@ class MultiJeepneyRouteFinder:
                         transfer_penalty=transfer_penalty,
                         transfer_walk_weight=transfer_walk_weight,
                         debug=debug,
+                        watch_routes=watch_routes,
                     )
                     results.extend(sub_results)
 
         return results
 
-    # ------------------------------------------------------------------
     def find_best_multi_route(
         self,
         all_routes: List[JeepneyRoute],
@@ -899,10 +926,17 @@ class MultiJeepneyRouteFinder:
         transfer_penalty: float = 500.0,
         transfer_walk_weight: float = 4.0,
         debug: bool = False,
+        watch_routes: Optional[Set[str]] = None,
     ) -> Optional[MultiJeepneyRouteResult]:
 
         if debug:
             print("🔄 Searching for multi-jeepney routes...")
+
+        if watch_routes:
+            print(f"\n👁  WATCHING routes: {watch_routes}")
+            print(f"    max_transfer_walk_distance : {max_transfer_walk_distance}m")
+            print(f"    transfer_penalty           : {transfer_penalty}")
+            print(f"    TRANSFER_ZONE_THRESHOLD    : {self.TRANSFER_ZONE_THRESHOLD}m\n")
 
         initial_path = _PartialPath.initial(start)
 
@@ -918,6 +952,7 @@ class MultiJeepneyRouteFinder:
             transfer_penalty=transfer_penalty,
             transfer_walk_weight=transfer_walk_weight,
             debug=debug,
+            watch_routes=watch_routes,
         )
 
         if not all_results:
@@ -928,6 +963,10 @@ class MultiJeepneyRouteFinder:
         all_results.sort(key=lambda r: r.total_score)
         best = all_results[0]
 
+        print(f"\n📊 ALL {len(all_results)} RESULTS (sorted by score):")
+        for rank, r in enumerate(all_results[:10], 1):
+            print(f"   #{rank:2d}  {r.route_summary:<25} score={r.total_score:8.1f}  dist={r.total_distance/1000:.2f}km  {r.number_of_transfers} transfer(s)")
+
         if debug:
             print(f"\n✅ BEST ROUTE: {best.route_summary}")
             print(f"   Transfers: {best.number_of_transfers}")
@@ -936,9 +975,24 @@ class MultiJeepneyRouteFinder:
             if len(all_results) > 1:
                 print(f"   (Found {len(all_results)} alternatives)\n")
 
+        def _corridor(result: MultiJeepneyRouteResult) -> tuple:
+            nums = [s.route.route_number for s in result.segments]
+            return (nums[0], nums[-1])
+
+        best_corridor = _corridor(best)
+        seen_corridors: set = {best_corridor}
+        unique_alternatives: List[MultiJeepneyRouteResult] = []
+        for r in all_results[1:]:
+            c = _corridor(r)
+            if c not in seen_corridors:
+                seen_corridors.add(c)
+                unique_alternatives.append(r)
+            if len(unique_alternatives) >= 2:
+                break
+        self._last_multi_alternatives = unique_alternatives
+
         return best
 
-    # ------------------------------------------------------------------
     def find_best_route_with_transfer(
         self,
         all_routes: List[JeepneyRoute],
@@ -947,8 +1001,14 @@ class MultiJeepneyRouteFinder:
         max_board_distance: float = 800.0,
         max_alight_distance: float = 500.0,
         debug: bool = False,
+        watch_routes: Optional[Set[str]] = None,
     ):
-        """Try a single route first; fall back to multi-route with transfer."""
+        self._last_direct_alternatives = []
+        self._last_multi_alternatives = []
+
+        print(f"\n📍 START : {start}")
+        print(f"🏁 DEST  : {dest}\n")
+
         best_route, best_meta = self._single_route_finder.find_best_route(
             all_routes, start, dest,
             max_board_distance=max_board_distance,
@@ -959,6 +1019,10 @@ class MultiJeepneyRouteFinder:
         if best_route is not None:
             if debug:
                 print("✅ Direct route found\n")
+            all_direct: List[Tuple[JeepneyRoute, RouteEvaluationMeta]] = (
+                [(best_route, best_meta)] + self._last_direct_alternatives
+            )
+            self._print_top3_direct(all_direct)
             return best_route, best_meta
 
         if debug:
@@ -969,19 +1033,99 @@ class MultiJeepneyRouteFinder:
             max_board_distance=max_board_distance,
             max_alight_distance=max_alight_distance,
             debug=debug,
+            watch_routes=watch_routes,
         )
 
         if multi_result is not None:
+            all_multi: List[MultiJeepneyRouteResult] = (
+                [multi_result] + self._last_multi_alternatives
+            )
+            self._print_top3_multi(all_multi)
             return multi_result
 
         if debug:
             print("❌ No route found\n")
         return None
 
+    @staticmethod
+    def _print_top3_direct(
+        results: List[Tuple[JeepneyRoute, RouteEvaluationMeta]],
+    ) -> None:
+        print("\n" + "=" * 60)
+        has_alternatives = len(results) > 1
+        if has_alternatives:
+            print(f"🏆 TOP {min(3, len(results))} DIRECT ROUTE OPTIONS (different route numbers)")
+        else:
+            print("🏆 BEST DIRECT ROUTE  (no other route numbers available)")
+        print("=" * 60)
 
-# ---------------------------------------------------------------------------
-# Convenience loader (mirrors the original get_jeepney_navigation helper)
-# ---------------------------------------------------------------------------
+        for rank, (route, meta) in enumerate(results[:3], start=1):
+            total_m = meta.board_dist_m + meta.jeepney_dist_m + meta.alight_dist_m
+            label = f"#{rank}" if has_alternatives else "✅"
+            print(
+                f"  {label}  Route {route.route_number} ({route.direction})\n"
+                f"       Score      : {meta.score:.1f}\n"
+                f"       Board walk : {meta.board_dist_m:.0f} m\n"
+                f"       Jeepney    : {meta.jeepney_dist_m:.0f} m\n"
+                f"       Alight walk: {meta.alight_dist_m:.0f} m\n"
+                f"       Total dist : {total_m / 1000:.2f} km"
+            )
+            if rank < len(results[:3]):
+                print("  " + "-" * 56)
+
+        if not has_alternatives:
+            print("\n  ℹ️  Only one route number services this trip.")
+        print("=" * 60 + "\n")
+
+    @staticmethod
+    def _print_top3_multi(
+        results: List[MultiJeepneyRouteResult],
+    ) -> None:
+        print("\n" + "=" * 60)
+        has_alternatives = len(results) > 1
+        if has_alternatives:
+            print(f"🏆 TOP {min(3, len(results))} TRANSFER ROUTE OPTIONS (different route combinations)")
+        else:
+            print("🏆 BEST TRANSFER ROUTE  (no other route combinations available)")
+        print("=" * 60)
+
+        for rank, result in enumerate(results[:3], start=1):
+            label = f"#{rank}" if has_alternatives else "✅"
+            print(
+                f"  {label}  {result.route_summary}\n"
+                f"       Transfers  : {result.number_of_transfers}\n"
+                f"       Score      : {result.total_score:.1f}\n"
+                f"       Distance   : {result.total_distance / 1000:.2f} km\n"
+                f"       Duration   : {result.total_duration / 60:.0f} min"
+            )
+            for i, seg in enumerate(result.segments):
+                m = seg.meta
+                print(
+                    f"       Leg {i + 1}: Jeepney {seg.route.route_number} ({seg.route.direction})"
+                    f" | board {m.board_dist_m:.0f}m walk"
+                    f" | ride {m.jeepney_dist_m:.0f}m"
+                    f" | alight {m.alight_dist_m:.0f}m walk"
+                )
+                print(
+                    f"               board_point  : {{'lat': {m.board_point[0]:.6f}, 'lng': {m.board_point[1]:.6f}}}\n"
+                    f"               alight_point : {{'lat': {m.alight_point[0]:.6f}, 'lng': {m.alight_point[1]:.6f}}}"
+                )
+                # Print transfer zone coordinates (alight from this leg → board next leg)
+                if i < len(result.transfers):
+                    t = result.transfers[i]
+                    print(
+                        f"               ↳ transfer zone\n"
+                        f"                 alight from leg : {{'lat': {t.from_alight_point[0]:.6f}, 'lng': {t.from_alight_point[1]:.6f}}}\n"
+                        f"                 board next leg  : {{'lat': {t.to_board_point[0]:.6f}, 'lng': {t.to_board_point[1]:.6f}}}\n"
+                        f"                 walk            : {t.walk_distance:.1f}m"
+                    )
+            if rank < len(results[:3]):
+                print("  " + "-" * 56)
+
+        if not has_alternatives:
+            print("\n  ℹ️  Only one route combination services this trip.")
+        print("=" * 60 + "\n")
+
 
 def load_routes(routes_path: str) -> List[JeepneyRoute]:
     with open(routes_path, "r") as f:
@@ -996,25 +1140,20 @@ def load_routes(routes_path: str) -> List[JeepneyRoute]:
     ]
 
 
-# ---------------------------------------------------------------------------
-# Example usage
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
     root_dir = Path(__file__).resolve().parent.parent
     routes_path = root_dir / "data" / "jeepney_routes.json"
-    transfers_path = root_dir / "data" / "transfer_spots.json"
 
     routes = load_routes(str(routes_path))
-
     finder = MultiJeepneyRouteFinder()
-    finder.load_transfer_spots(str(transfers_path))
 
     my_start: LatLng = (10.7202, 122.5621)
     my_dest: LatLng  = (10.7015, 122.5690)
 
     result = finder.find_best_route_with_transfer(
-        routes, my_start, my_dest, debug=True
+        routes, my_start, my_dest,
+        debug=False,                          # keep Phase 1 quiet
+        watch_routes={"3", "9", "10", "12"},  # watch all relevant routes
     )
 
     if result is None:
@@ -1029,7 +1168,6 @@ if __name__ == "__main__":
             print(f"     Alight at: {m.alight_point} (Walk: {m.alight_dist_m:.0f}m)")
             print(f"     Ride: {m.jeepney_dist_m:.0f}m")
     else:
-        # Single route result: (JeepneyRoute, RouteEvaluationMeta)
         route, meta = result
         print(f"\nFound Direct Route: {route.route_number} ({route.direction})")
         print(f"  Board at: {meta.board_point} (Walk: {meta.board_dist_m:.0f}m)")
