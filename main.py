@@ -47,6 +47,8 @@ class RouteRequest(BaseModel):
 
 
 class TrafficSegmentRequest(BaseModel):
+    order_index: int = -1   # position in the payload array — echoed back so the
+                            # frontend can resolve the correct route slot unambiguously
     segment_index: int
     route_number: str
     # jeepney_polyline uses {latitude, longitude} — same shape as route response
@@ -105,7 +107,12 @@ def fetch_traffic(req: TrafficRequest):
             route_number=seg.route_number,
             segment_index=seg.segment_index,
         )
-        return {"segment_index": seg.segment_index, "traffic": traffic}
+        return {
+            "order_index":   seg.order_index,
+            "segment_index": seg.segment_index,
+            "route_number":  seg.route_number,
+            "traffic":       traffic,
+        }
 
     def _stream() -> Generator[str, None, None]:
         with ThreadPoolExecutor(max_workers=min(len(req.segments), 8)) as executor:
